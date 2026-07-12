@@ -33,6 +33,10 @@ def _init(settings: Settings) -> None:
     llm_client.init_llm_client(settings)
     _storage = Storage(settings)
 
+    # 각 tools 모듈은 임포트 시점에 @mcp.tool() 데코레이터로 자기 자신을 등록한다.
+    # (모듈이 위 mcp 인스턴스를 참조하므로 mcp 정의 이후, 여기서 임포트한다.)
+    from hcr_mcp.fit import tool as _fit_tool  # noqa: F401
+
 
 def main() -> None:
     try:

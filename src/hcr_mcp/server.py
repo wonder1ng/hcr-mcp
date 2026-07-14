@@ -1,3 +1,4 @@
+import asyncio
 import sys
 
 from mcp.server.fastmcp import FastMCP
@@ -46,6 +47,13 @@ def main() -> None:
         raise SystemExit(1) from e
 
     _init(settings)
+
+    try:
+        asyncio.run(llm_client.validate_models())
+    except HcrMcpError as e:
+        print(f"[hcr-mcp] 시작 실패: {e}", file=sys.stderr)
+        raise SystemExit(1) from e
+
     mcp.run()
 
 

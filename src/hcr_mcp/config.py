@@ -12,8 +12,8 @@ StorageLevel = Literal["none", "results", "raw"]
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="HCR_MCP_", env_file=".env", extra="ignore")
 
-    llm_api_key: str
-    llm_base_url: str | None = None
+    llm_api_key: str  # OpenAI API 키 (채팅+임베딩 공용 기본값)
+    llm_embedding_api_key: str | None = None  # 생략 시 llm_api_key 재사용. 임베딩만 별도 키/과금으로 분리하고 싶을 때만 설정.
     llm_chat_model: str = "gpt-4o-mini"
     llm_embedding_model: str = "text-embedding-3-small"
 

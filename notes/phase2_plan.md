@@ -252,3 +252,21 @@ plans 디렉터리에도 같은 내용 존재).
 검증만 마친 상태 — 사용자가 실제 동작을 아직 검증하지 못함. 실제 부서가 여러 개 언급된 공고
 URL로 `collect_job_posting` end-to-end 호출 검증(계획 원본 검증 2번), `analyze_fit` MCP 툴
 전체 회귀 검증(계획 원본 검증 3번)이 필요 — 둘 다 실제 API 호출 필요해서 이번 세션에서는 안 함.
+
+### PR #4 셀프 리뷰에서 나온 설계 결정 — `job_posting` 저장은 항상 저장으로 확정 (코드 미반영)
+
+`job_posting/collector.py`의 `storage.save_raw`/`save_report`가 `storage_level`을 받지 않고
+무조건 저장하는 게 `fit/tool.py::analyze_fit`이 노출하는 `storage_level="none"` 옵션과
+어긋나 보여 리뷰에서 짚었는데, 사용자가 즉석에서 설계를 확정함:
+
+- **같은 공고를 다른(개선된) 자소서로 재분석할 가능성이 있어서, 채용공고 저장은 의도적으로
+  `storage_level`과 무관하게 항상 저장한다.** `report_builder.collect_and_save_news`의
+  "의무 저장" 패턴과 동일선상 — 우연히 일치한 게 아니라 이번에 명시적으로 재확인됨.
+- **`storage_level`로 저장 여부를 매 호출 선택하게 하던 기존 옵션 자체를 없앤다** — 대신
+  **최초 사용 시 1회** "이 데이터가 로컬에 저장됩니다" 고지 + 저장 권한 동의를 받는 흐름을
+  넣는다(반복 호출마다 묻지 않음). 아직 구현 안 됨 — 다음 작업 항목:
+  - 최초 실행 감지(예: `data_dir`에 마커 파일 존재 여부) 방식 설계.
+  - 어느 계층(MCP 툴 호출부 vs `storage.py` 자체)에서 동의 흐름을 넣을지 결정.
+  - `config.py`의 `StorageLevel`/`default_storage_level`, `fit/tool.py`의 `storage_level`
+    파라미터를 이 새 정책에 맞게 어떻게 정리할지(완전 제거 vs 다른 의미로 재정의) 결정.
+- 이번 세션에서는 **계획만 기록**, 코드는 아직 변경하지 않음 — 다음 세션에서 구현.

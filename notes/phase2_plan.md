@@ -270,3 +270,13 @@ URL로 `collect_job_posting` end-to-end 호출 검증(계획 원본 검증 2번)
   - `config.py`의 `StorageLevel`/`default_storage_level`, `fit/tool.py`의 `storage_level`
     파라미터를 이 새 정책에 맞게 어떻게 정리할지(완전 제거 vs 다른 의미로 재정의) 결정.
 - 이번 세션에서는 **계획만 기록**, 코드는 아직 변경하지 않음 — 다음 세션에서 구현.
+
+### PR #4 셀프 리뷰에서 나온 미해결 지적 — `job_posting/schemas.py`의 `jobs` 필드 required 여부
+
+`JobPosting.jobs: list[JobEntry] = Field(default_factory=list)`가 구조화 출력 스키마상
+optional로 잡혀서, 원본 `job_schema_v2.json`이 `jobs`를 required로 강제하던 것과 다르다
+(PR #4 인라인 코멘트, `src/hcr_mcp/job_posting/schemas.py:92`). LLM이 이론상 `jobs`를 빈
+배열로 응답해도 스키마 검증은 통과 — `jobs[]`가 이 스키마의 핵심 데이터라 "값이 없음"과
+"모델이 안 채움"을 구분 못 하는 게 문제일 수 있다. 아직 결론 안 남 — 다음 세션에서 결정할 것:
+기본값 제거해 required로 되돌릴지, 아니면 `prompts.py`의 프롬프트 강제만으로 충분하다고 보고
+현행 유지할지.

@@ -13,12 +13,7 @@ import json
 import re
 from typing import Any
 
-import openai
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.runnables import Runnable
-
 from hcr_mcp import llm_client
-from hcr_mcp.errors import HcrMcpError
 from hcr_mcp.fit.prompts import (
     CANDIDATE_PROFILE_SYSTEM, CANDIDATE_PROFILE_HUMAN,
     JOB_PROFILE_SYSTEM, JOB_PROFILE_HUMAN,
@@ -78,44 +73,25 @@ def _load_company_data(report: dict[str, Any] | None) -> dict[str, Any]:
     return {k: v for k, v in data.items() if v}
 
 
-def _chain(system: str, human: str, schema: type) -> Runnable:
-    prompt = ChatPromptTemplate.from_messages([("system", system), ("human", human)])
-    return prompt | llm_client.get_chat_model().with_structured_output(schema)
-
-
-async def _safe_ainvoke(runnable: Runnable, inputs: dict[str, Any]) -> Any:
-    """LangChain 체인 호출의 openai 예외를 명확한 한글 메시지로 변환."""
-    try:
-        return await runnable.ainvoke(inputs)
-    except openai.AuthenticationError as e:
-        raise HcrMcpError("LLM API 키가 유효하지 않습니다. HCR_MCP_LLM_API_KEY 값을 확인하세요.") from e
-    except openai.RateLimitError as e:
-        raise HcrMcpError("LLM API 요청 한도를 초과했습니다. 잠시 후 다시 시도하세요.") from e
-    except (openai.APIConnectionError, openai.APITimeoutError) as e:
-        raise HcrMcpError(f"LLM API 서버에 연결할 수 없습니다: {e}") from e
-    except openai.APIError as e:
-        raise HcrMcpError(f"적합도 분석 중 LLM 호출 오류가 발생했습니다: {e}") from e
-
-
 # ── Stage 1: Profile 생성 ─────────────────────────────────────────────
 
 async def _gen_candidate_profile(user_doc_json: str) -> CandidateProfile:
-    return await _safe_ainvoke(
-        _chain(CANDIDATE_PROFILE_SYSTEM, CANDIDATE_PROFILE_HUMAN, CandidateProfile),
+    return await llm_client.safe_ainvoke(
+        llm_client.structured_chain(CANDIDATE_PROFILE_SYSTEM, CANDIDATE_PROFILE_HUMAN, CandidateProfile),
         {"user_doc_json": user_doc_json},
     )
 
 
 async def _gen_job_profile(job_doc_json: str) -> JobProfile:
-    return await _safe_ainvoke(
-        _chain(JOB_PROFILE_SYSTEM, JOB_PROFILE_HUMAN, JobProfile),
+    return await llm_client.safe_ainvoke(
+        llm_client.structured_chain(JOB_PROFILE_SYSTEM, JOB_PROFILE_HUMAN, JobProfile),
         {"job_doc_json": job_doc_json},
     )
 
 
 async def _gen_company_profile(company_data_json: str) -> CompanyProfile:
-    return await _safe_ainvoke(
-        _chain(COMPANY_PROFILE_SYSTEM, COMPANY_PROFILE_HUMAN, CompanyProfile),
+    return await llm_client.safe_ainvoke(
+        llm_client.structured_chain(COMPANY_PROFILE_SYSTEM, COMPANY_PROFILE_HUMAN, CompanyProfile),
         {"company_data_json": company_data_json},
     )
 
@@ -123,8 +99,8 @@ async def _gen_company_profile(company_data_json: str) -> CompanyProfile:
 # ── Stage 2: 매칭 ─────────────────────────────────────────────────────
 
 async def _match_job(candidate: CandidateProfile, job: JobProfile) -> LLMJobMatchingResult:
-    return await _safe_ainvoke(
-        _chain(REQUIREMENT_MATCHER_SYSTEM, REQUIREMENT_MATCHER_HUMAN, LLMJobMatchingResult),
+    return await llm_client.safe_ainvoke(
+        llm_client.structured_chain(REQUIREMENT_MATCHER_SYSTEM, REQUIREMENT_MATCHER_HUMAN, LLMJobMatchingResult),
         {
             "candidate_profile_json": candidate.model_dump_json(indent=2),
             "job_profile_json": job.model_dump_json(indent=2),
@@ -133,8 +109,8 @@ async def _match_job(candidate: CandidateProfile, job: JobProfile) -> LLMJobMatc
 
 
 async def _match_company(candidate: CandidateProfile, company: CompanyProfile) -> LLMCompanyMatchingResult:
-    return await _safe_ainvoke(
-        _chain(COMPANY_MATCHER_SYSTEM, COMPANY_MATCHER_HUMAN, LLMCompanyMatchingResult),
+    return await llm_client.safe_ainvoke(
+        llm_client.structured_chain(COMPANY_MATCHER_SYSTEM, COMPANY_MATCHER_HUMAN, LLMCompanyMatchingResult),
         {
             "candidate_profile_json": candidate.model_dump_json(indent=2),
             "company_profile_json": company.model_dump_json(indent=2),
@@ -233,8 +209,8 @@ def _format_matches_text(job_matches: list[JobMatch], company_matches: list[Comp
 
 async def _gen_report(job_matches: list[JobMatch], company_matches: list[CompanyMatch]) -> LLMReportSummary:
     job_text, company_text = _format_matches_text(job_matches, company_matches)
-    return await _safe_ainvoke(
-        _chain(REPORT_GENERATOR_SYSTEM, REPORT_GENERATOR_HUMAN, LLMReportSummary),
+    return await llm_client.safe_ainvoke(
+        llm_client.structured_chain(REPORT_GENERATOR_SYSTEM, REPORT_GENERATOR_HUMAN, LLMReportSummary),
         {"job_matches_text": job_text, "company_matches_text": company_text},
     )
 
@@ -243,17 +219,17 @@ async def _gen_report(job_matches: list[JobMatch], company_matches: list[Company
 
 async def analyze_fit(
     candidate_doc: dict[str, Any],
-    job_doc_text: str,
+    job_doc_json: str,
     company_report: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    """이력서(candidate_doc) × 공고(job_doc_text) × 회사 리포트(company_report, 선택) → 적합도 분석 결과."""
+    """이력서(candidate_doc) × 공고(job_doc_json) × 회사 리포트(company_report, 선택) → 적합도 분석 결과."""
     company_data = _load_company_data(company_report)
     user_doc_json = json.dumps({"resume": candidate_doc}, ensure_ascii=False, default=str)
     company_data_json = json.dumps(company_data, ensure_ascii=False)
 
     candidate_profile, job_profile, company_profile = await asyncio.gather(
         _gen_candidate_profile(user_doc_json),
-        _gen_job_profile(job_doc_text),
+        _gen_job_profile(job_doc_json),
         _gen_company_profile(company_data_json),
     )
 

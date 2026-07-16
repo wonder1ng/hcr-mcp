@@ -3,6 +3,9 @@ import functools
 from typing import Any, Callable, Coroutine, TypeVar
 
 import openai
+import tiktoken
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import Runnable
 from langchain_openai import ChatOpenAI
 from openai import AsyncOpenAI
 
@@ -63,6 +66,13 @@ def get_chat_model() -> ChatOpenAI:
     return _chat_model
 
 
+def structured_chain(system: str, human: str, schema: type) -> Runnable:
+    """system/human 프롬프트 + Pydantic 스키마로 구조화 출력 체인을 만든다.
+    fit/service.py, company_report/competitor_finder.py, job_posting/collector.py가 공통으로 쓰는 패턴."""
+    prompt = ChatPromptTemplate.from_messages([("system", system), ("human", human)])
+    return prompt | get_chat_model().with_structured_output(schema)
+
+
 def _translate_openai_errors(fn: Callable[..., Coroutine[Any, Any, T]]) -> Callable[..., Coroutine[Any, Any, T]]:
     """openai SDK 예외를 사용자가 바로 이해할 수 있는 한글 메시지로 변환."""
 
@@ -102,13 +112,58 @@ async def chat(messages: list[dict[str, str]], **kwargs: Any) -> str:
 
 
 @_translate_openai_errors
+async def safe_ainvoke(runnable: Runnable, inputs: dict[str, Any]) -> Any:
+    """LangChain 체인(structured_chain 등) 호출의 openai 예외를 명확한 한글 메시지로 변환."""
+    return await runnable.ainvoke(inputs)
+
+
+_EMBED_MAX_TOKENS_PER_REQUEST = 250_000  # OpenAI 실제 요청 한도(300k 토큰)보다 여유를 둔 안전선
+_EMBED_ENCODING = "cl100k_base"  # text-embedding-3-* 계열이 쓰는 인코딩(tiktoken 공식 매핑 기준)
+
+
+def _batch_by_token_limit(texts: list[str], max_tokens: int) -> list[list[str]]:
+    """기사(텍스트) 단위로 배치를 나누되(하나의 텍스트를 쪼개지 않음), 각 배치의 누적 토큰
+    수가 max_tokens를 넘지 않도록 실제 토큰 수를 세어가며 나눈다. 텍스트를 하나씩 훑으면서
+    현재 배치에 더했을 때 한도를 넘으면 그 지점에서 새 배치를 시작한다 — 그래서 유난히 긴
+    기사가 섞여 있어도(짧은 기사 위주 배치는 더 많이, 긴 기사가 섞인 배치는 더 적게 묶여)
+    그 배치는 자동으로 작아진다. 글자 수 어림(4자≈1토큰 같은 영어권 규칙)은 쓰지 않는다 —
+    실측: 이 프로젝트의 기사 본문(한글 위주)은 글자 수와 토큰 수가 거의 1:1이라 어림으로는
+    여전히 한도를 넘길 수 있다. tiktoken 인코딩 비용(텍스트당 수백 마이크로초)은 API 왕복
+    시간(수백 ms~수 초)에 비해 무시할 수준이라 정확히 세는 쪽을 택했다.
+
+    ponytail: 텍스트 하나가 그 자체로 max_tokens를 넘으면 그 하나만 담은 배치로 분리되지만
+    여전히 요청은 실패한다 — 실측 기사 본문 최대치(8,143 토큰)가 이 상한의 3% 수준이라 현재는
+    발생하지 않지만, 발생하면 해당 텍스트를 잘라 보내는 로직이 필요하다."""
+    enc = tiktoken.get_encoding(_EMBED_ENCODING)
+    batches: list[list[str]] = []
+    current: list[str] = []
+    current_tokens = 0
+    for text in texts:
+        n = len(enc.encode(text))
+        if current and current_tokens + n > max_tokens:
+            batches.append(current)
+            current, current_tokens = [], 0
+        current.append(text)
+        current_tokens += n
+    if current:
+        batches.append(current)
+    return batches
+
+
+@_translate_openai_errors
 async def embed_batch(texts: list[str]) -> list[list[float]]:
-    """실시간 요청 경로용 동기(=await 가능한 단발) 임베딩 호출."""
+    """실시간 요청 경로용 배치 임베딩 호출. OpenAI의 요청 크기 한도(300k 토큰/요청)를 넘지
+    않도록 _batch_by_token_limit로 미리 쪼개 순차 호출한다 — 텍스트 총량이 많은 호출(예: 뉴스
+    기사 다건 dedup용 임베딩)이 한 번에 한도를 넘겨 실패하던 문제(실측)를 여기서 막는다
+    (embed_batch를 쓰는 모든 호출부가 자동으로 보호됨)."""
     if not texts:
         return []
     client = _get_embedding_client()
-    resp = await client.embeddings.create(model=_settings.llm_embedding_model, input=texts)  # type: ignore[union-attr]
-    return [item.embedding for item in resp.data]
+    embeddings: list[list[float]] = []
+    for batch in _batch_by_token_limit(texts, _EMBED_MAX_TOKENS_PER_REQUEST):
+        resp = await client.embeddings.create(model=_settings.llm_embedding_model, input=batch)  # type: ignore[union-attr]
+        embeddings.extend(item.embedding for item in resp.data)
+    return embeddings
 
 
 def _sniff_mime(image_bytes: bytes) -> str:

@@ -39,6 +39,7 @@ import random
 import re
 from calendar import monthrange
 from datetime import date, timedelta
+from typing import Callable
 
 import httpx
 from bs4 import BeautifulSoup
@@ -88,11 +89,13 @@ _RELEVANCE_LINE = {
     "job": '1. "{keyword}" 직무와 무관한 기사(단어만 우연히 겹치는 경우 등)는 결과에서 제외하세요.\n',
 }
 
+_SUBJECT_LABEL = {"company": "기업명", "industry": "산업/업종 키워드", "job": "직무명"}
 
 def _group_system_prompt(keyword: str, subject_kind: str) -> str:
     relevance_line = _RELEVANCE_LINE[subject_kind].format(keyword=keyword)
     return (
-        f'당신은 "{keyword}" 관련 뉴스 기사 제목 목록을 분석하는 전문가입니다.\n'
+        f'"{keyword}"는 {_SUBJECT_LABEL[subject_kind]}입니다(일반 명사와 우연히 같은 표기여도 이 의미로 판단하세요).\n'
+        f'당신은 "{keyword}" 관련 뉴스를 수집하는 스크래퍼입니다.\n'
         "번호가 매겨진 기사 제목·날짜 목록이 주어지면 두 가지를 하세요:\n"
         f"{relevance_line}"
         "2. 남은 기사 중 실질적으로 같은 사건이나 같은 트렌드/이슈를 다루는 기사끼리 그룹으로\n"
@@ -121,7 +124,7 @@ _TRANSPORT_RETRY_DELAY_RANGE = (1.0, 3.9)  # 초 — HcR/scrapy/news_links_scrap
 
 
 def _date_range_params(start_date: date, end_date: date) -> dict:
-    """실증 확인된 Naver 뉴스검색 커스텀 기간 필터 조합. pd=3 + nso=so:dd,p:from...to... + qdt=1
+    """실증 확인된 뉴스검색 커스텀 기간 필터 조합. pd=3 + nso=so:dd,p:from...to... + qdt=1
     + sort=1(최신순) 조합이 해당 구간으로 정확히 좁혀준다(사용자 확인 레퍼런스 URL 기준)."""
     ds, de = start_date.strftime("%Y.%m.%d"), end_date.strftime("%Y.%m.%d")
     nso = f"so:dd,p:from{start_date.strftime('%Y%m%d')}to{end_date.strftime('%Y%m%d')}"
@@ -323,6 +326,51 @@ async def _dedup_cluster_by_embedding(articles: list[dict]) -> list[list[dict]]:
     return [[articles[i] for i in members] for members in clusters]
 
 
+def _relevance_only_system_prompt(keyword: str, subject_kind: str) -> str:
+    relevance_line = _RELEVANCE_LINE[subject_kind].format(keyword=keyword)
+    return (
+        f'"{keyword}"는 {_SUBJECT_LABEL[subject_kind]}입니다(일반 명사와 우연히 같은 표기여도 이 의미로 판단하세요).\n'
+        f'당신은 "{keyword}" 관련 뉴스를 수집하는 스크래퍼입니다.\n'
+        "번호가 매겨진 기사 제목·날짜·요약 목록이 주어지면 다음 기준으로 판단하세요:\n"
+        f"{relevance_line}"
+        "relevant 필드에 관련 있다고 판단한 기사 번호(0부터, 입력 목록 인덱스 그대로)를 담으세요."
+    )
+
+
+class _RelevantIndices(BaseModel):
+    relevant: list[int] = Field(description="관련 있다고 판단한 기사 번호(0부터, 입력 목록 인덱스 그대로)")
+
+
+async def _filter_relevant_batch(keyword: str, subject_kind: str, articles: list[dict]) -> list[dict]:
+    """제목+날짜+스니펫만으로 무관 기사를 걸러낸다 — 스니펫은 검색 결과 파싱 단계에서 이미
+    확보돼 추가 요청 없이 쓸 수 있고(_group_into_issues의 관련성 판단과 동일한 근거), 본문은
+    이 판단에 필요하지 않다. 본문 수집(_attach_body, 네트워크 요청)·임베딩(_dedup_cluster_by_embedding)
+    보다 먼저 실행해서 무관 기사가 그 이후 단계까지 도달하지 않게 한다 — 무관 기사의 본문을
+    아예 안 가져오므로 네트워크 비용도, 임베딩에 실리는 토큰량도 함께 줄어든다(대량 기사가
+    임베딩 요청 한도를 넘는 문제의 근본 원인 완화 — llm_client.embed_batch의 배치 분할은
+    그래도 필요한 안전망이지만, 애초에 실리는 양 자체를 줄이는 게 먼저).
+    구조화 출력(with_structured_output) 사용 — _summarize_and_classify_batch/_reconstruct_batch와
+    동일 패턴, 범위 밖 인덱스는 걸러낸다. 이 필터를 통과 못한
+    (관련 없다고 판단된) 기사가 있어도, 이후 _group_into_issues(관련성 재판단)와
+    _filter_unrelated_issues(결정론적 키워드 포함 검사)가 다시 한 번 노이즈를 걸러내는 안전망으로
+    남아 있다 — 여기서 뭔가 놓쳐도 최종 결과 전까지 노이즈 제거 기회가 두 번 더 있다."""
+    lines = "\n".join(f"{i}. [{a['date']}] {a['title']} — {a.get('snippet') or ''}" for i, a in enumerate(articles))
+    chain = ChatPromptTemplate.from_messages(
+        [("system", _relevance_only_system_prompt(keyword, subject_kind)), ("human", "기사 목록:\n{articles_text}")]
+    ) | llm_client.get_chat_model().with_structured_output(_RelevantIndices)
+    try:
+        result: _RelevantIndices = await chain.ainvoke({"articles_text": lines})
+    except Exception:  # noqa: BLE001 — 예상 못한 오류도 여기서 삼켜야 이 배치가 전체 수집을 중단시키지 않는다
+        return articles  # 판정 실패 시 걸러내지 않고 전부 통과 — 이후 두 안전망이 여전히 노이즈를 걸러낸다
+    valid = [i for i in result.relevant if 0 <= i < len(articles)]
+    return [articles[i] for i in valid]
+
+
+async def _filter_relevant(keyword: str, subject_kind: str, articles: list[dict]) -> list[dict]:
+    """_BATCH_SIZE 단위로 나눠 관련성 필터링(제목+스니펫만 사용, 본문 불필요)."""
+    return await _run_batched(articles, lambda batch: _filter_relevant_batch(keyword, subject_kind, batch))
+
+
 async def _group_into_issues(keyword: str, subject_kind: str, articles: list[dict]) -> list[list[dict]]:
     """제목+날짜+스니펫을 LLM에 보내 무관한 기사(동명이인 등)를 걸러내고 같은 이슈/트렌드끼리
     그룹핑. 스니펫은 검색 단계에서 이미 확보해둔 정보라 추가 요청 없이 공짜로 쓸 수 있는데,
@@ -453,14 +501,6 @@ def _earliest_article(articles: list[dict]) -> dict | None:
     if dated:
         return min(dated, key=lambda a: a["date"])
     return articles[0] if articles else None
-
-
-def _noise_ratio(articles: list[dict], issue_groups: list[list[dict]]) -> float:
-    """LLM이 무관 판정해 어떤 그룹에도 넣지 않은(=제외한) 기사의 비율."""
-    if not articles:
-        return 0.0
-    covered = sum(len(g) for g in issue_groups)
-    return 1 - (covered / len(articles))
 
 
 _BATCH_SIZE = 25  # 한 번의 LLM 호출에 넣는 이슈 개수 상한 — 이보다 많으면 이 단위로 나눠 호출한다.
@@ -806,7 +846,12 @@ async def _group_and_dedup(keyword: str, subject_kind: str, articles: list[dict]
     return _filter_unrelated_issues(keyword, subject_kind, expanded)
 
 
-async def _collect_issues(search_query: str, subject_kind: str, display_keyword: str | None = None) -> tuple[list[dict], bool]:
+async def _collect_issues(
+    search_query: str,
+    subject_kind: str,
+    on_raw_ready: Callable[[list[dict]], None],
+    display_keyword: str | None = None,
+) -> tuple[list[dict], bool]:
     """검색어 → (이슈 목록, 노이즈 많음 여부). _search_rounds가 정한 라운드(6개월→올해 나머지→
     작년→재작년→(4/1 이전이면)그전해)를 순서대로 검색하고, 이슈가 _MIN_ISSUES(5) 미만이면 다음
     라운드로 넘어간다(_date_range_params 참고 — pd=3+nso 커스텀 기간 필터로 구간을 정확히
@@ -818,15 +863,23 @@ async def _collect_issues(search_query: str, subject_kind: str, display_keyword:
     display_keyword: LLM 관련성 판단 프롬프트에 보여줄 이름(검색어에 "기업"/대표명 등 부가어가
     섞여도 프롬프트에는 원래 이름만 노출하기 위함). 생략하면 search_query를 그대로 쓴다.
 
+    on_raw_ready: 매 라운드 스크래핑(본문 확보까지) 직후, 그룹핑/임베딩/요약을 시작하기 전에
+    호출된다(라운드마다 누적된 전체 articles로 매번 다시 호출 — 최신 스냅샷으로 덮어쓰기 용도).
+    스크래핑은 재수집 비용이 가장 크고, 뒤이은 LLM/임베딩 처리는 실패 가능성이 있는 단계라
+    (예: 임베딩 배치 크기 초과) 그 실패가 이미 확보한 스크래핑 결과까지 날려버리지 않도록,
+    저장을 선별 단계보다 먼저 끝내둔다. 필수 인자 — 저장을 건너뛰는 호출은 허용하지 않는다
+    (의무 저장: 재수집 비용이 가장 큰 데이터를 저장 누락으로 잃는 일을 원천 차단).
+
     검색 결과가 없거나 전부 실패해도 예외를 던지지 않고 빈 리스트를 반환한다 — 임의의 키워드에
     최근 언급 기사가 없는 것은 정상적인 결과다.
     """
     display_keyword = display_keyword or search_query
     async with httpx.AsyncClient(follow_redirects=True) as client:
-        articles: list[dict] = []
+        articles: list[dict] = []      # 관련성 필터 + 본문 수집까지 끝난 기사(선별 단계 입력)
         seen_urls: set[str] = set()
         selected: list[list[dict]] = []
-        issue_groups: list[list[dict]] = []
+        found_count = 0     # 관련성 필터 이전, 검색으로 실제 찾은 기사 수(누적) — "검색 결과 자체가 없음" 판단용
+        relevant_count = 0  # 관련성 필터 통과 기사 수(누적) — 노이즈 비율 계산용(임베딩/그룹핑 완료를 기다릴 필요 없음)
 
         for window_start, window_end in _search_rounds(date.today()):
             round_new: list[dict] = await _search_window(client, search_query, window_start, window_end, seen_urls)
@@ -839,21 +892,33 @@ async def _collect_issues(search_query: str, subject_kind: str, display_keyword:
                 if gap_end >= window_start:
                     round_new.extend(await _search_window(client, search_query, window_start, gap_end, seen_urls))
 
+            found_count += len(round_new)
+
+            if round_new:
+                # 본문 수집(네트워크 요청)·임베딩보다 먼저, 제목+스니펫만으로 무관 기사를 걸러낸다
+                # (_filter_relevant 참고) — 둘 다 검색 결과 파싱 단계에서 이미 확보된 값이라 추가
+                # 요청이 필요 없다. 무관 기사는 본문을 아예 안 가져오므로 네트워크 비용도, 뒤이은
+                # 임베딩에 실리는 토큰량도 함께 줄어든다.
+                round_new = await _filter_relevant(display_keyword, subject_kind, round_new)
+            relevant_count += len(round_new)
+
             if round_new:
                 # 본문을 그룹핑/대표기사 선정보다 먼저 확보해둔다 — 제목만 보고 고른 뒤 나중에
-                # 본문을 붙이면, 중복 판단·관련성 판단·대표 선정 전부 제목만으로 하게 돼 정확도가
-                # 떨어진다(실증: 무관 기사가 스니펫엔 검색어가 우연히 강조돼 안 걸러짐, 대표
-                # 기사도 언론사 다양성만으로 뽑혀 실제 사건과 다른 기사가 섞여 들어감). 수집
-                # 단계에서 한 번만 가져오면 이후 모든 단계가 같은 본문을 재사용한다.
+                # 본문을 붙이면, 중복 판단·대표 선정 전부 제목만으로 하게 돼 정확도가 떨어진다
+                # (실증: 대표 기사도 언론사 다양성만으로 뽑혀 실제 사건과 다른 기사가 섞여 들어감).
+                # 수집 단계에서 한 번만 가져오면 이후 모든 단계가 같은 본문을 재사용한다.
                 fetched = await asyncio.gather(*[_attach_body(client, a) for a in round_new])
                 round_new = list(fetched)
             articles.extend(round_new)
 
-            if not articles:
+            on_raw_ready(articles)  # 임베딩 이전 — 이후 단계가 실패해도 이미 저장됨
+
+            if not found_count:
                 break  # 검색 결과 자체가 없음 — 기간을 늘려도 소용없음
 
-            issue_groups = await _group_and_dedup(display_keyword, subject_kind, articles)
-            selected = await _select_top_issues(issue_groups)
+            if articles:
+                issue_groups = await _group_and_dedup(display_keyword, subject_kind, articles)
+                selected = await _select_top_issues(issue_groups)
 
             if len(selected) >= _MIN_ISSUES:
                 break
@@ -861,7 +926,7 @@ async def _collect_issues(search_query: str, subject_kind: str, display_keyword:
         if not selected:
             return [], False
 
-        noisy = len(articles) >= _NOISE_MIN_ARTICLES and _noise_ratio(articles, issue_groups) > _NOISE_RATIO_THRESHOLD
+        noisy = found_count >= _NOISE_MIN_ARTICLES and (1 - relevant_count / found_count) > _NOISE_RATIO_THRESHOLD
 
     issues: list[dict] = []
     for group in selected:
@@ -889,7 +954,11 @@ def _company_query_variants(company_name: str, ceo_name: str | None) -> list[str
     return variants
 
 
-async def collect_recent_issues(company_name: str, ceo_name: str | None = None) -> tuple[list[dict], list[dict]]:
+async def collect_recent_issues(
+    company_name: str,
+    on_raw_ready: Callable[[list[dict]], None],
+    ceo_name: str | None = None,
+) -> tuple[list[dict], list[dict]]:
     """채용공고를 올린 회사의 최근 이슈 목록 (company_report가 사용).
     반환: (토픽별로 묶인 이슈 목록(event_taxonomy.py 기준, gist+출처+중요도), 원문 보존본(본문 포함, 저장 전용)).
 
@@ -899,25 +968,33 @@ async def collect_recent_issues(company_name: str, ceo_name: str | None = None) 
     처음 두 변형만 시도한다. 이 재시도는 채용 대상 회사 검색에만 쓴다 — 산업/직무 트렌드
     검색(collect_industry_trend/collect_job_trend)은 특정 회사를 짚는 게 아니라 노이즈 성격이
     달라 적용하지 않는다.
+
+    on_raw_ready: _collect_issues 참고 — 필수 인자(의무 저장), 생략 불가.
     """
     issues: list[dict] = []
     for query in _company_query_variants(company_name, ceo_name):
-        issues, noisy = await _collect_issues(query, "company", display_keyword=company_name)
+        issues, noisy = await _collect_issues(query, "company", on_raw_ready, display_keyword=company_name)
         if not noisy:
             break
     return await _finalize_issues(issues)
 
 
-async def collect_industry_trend(industry_keyword: str) -> tuple[list[dict], list[dict]]:
+async def collect_industry_trend(
+    industry_keyword: str, on_raw_ready: Callable[[list[dict]], None]
+) -> tuple[list[dict], list[dict]]:
     """산업/업종 관련 최근 트렌드·이슈 목록 (company_report가 사용).
-    반환: (토픽별로 묶인 이슈 목록(event_taxonomy.py 기준, gist+출처+중요도), 원문 보존본(본문 포함, 저장 전용))."""
-    issues, _ = await _collect_issues(industry_keyword, "industry")
+    반환: (토픽별로 묶인 이슈 목록(event_taxonomy.py 기준, gist+출처+중요도), 원문 보존본(본문 포함, 저장 전용)).
+    on_raw_ready: _collect_issues 참고 — 필수 인자(의무 저장), 생략 불가."""
+    issues, _ = await _collect_issues(industry_keyword, "industry", on_raw_ready)
     return await _finalize_issues(issues)
 
 
-async def collect_job_trend(job_title: str) -> tuple[list[dict], list[dict]]:
+async def collect_job_trend(
+    job_title: str, on_raw_ready: Callable[[list[dict]], None]
+) -> tuple[list[dict], list[dict]]:
     """직무 관련 최근 트렌드·이슈 목록 (fit이 사용 — company_report가 job_title을 받았을 때
     미리 수집해 job_trend로 캐시해두면 fit이 재수집 없이 가져다 쓴다).
-    반환: (토픽별로 묶인 이슈 목록(event_taxonomy.py 기준, gist+출처+중요도), 원문 보존본(본문 포함, 저장 전용))."""
-    issues, _ = await _collect_issues(job_title, "job")
+    반환: (토픽별로 묶인 이슈 목록(event_taxonomy.py 기준, gist+출처+중요도), 원문 보존본(본문 포함, 저장 전용)).
+    on_raw_ready: _collect_issues 참고 — 필수 인자(의무 저장), 생략 불가."""
+    issues, _ = await _collect_issues(job_title, "job", on_raw_ready)
     return await _finalize_issues(issues)

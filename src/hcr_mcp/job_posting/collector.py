@@ -87,6 +87,7 @@ async def collect_job_posting(
 
     posting.raw_meta.source_url = url
     posting.raw_meta.vision_used = vision_used
+    posting.raw_text = posting_text
     _apply_deadline_fallback(posting, posting_text)
     _warn_identical_tracks(posting)
 

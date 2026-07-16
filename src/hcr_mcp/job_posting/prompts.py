@@ -12,11 +12,25 @@ JOB_POSTING_SYSTEM = """\
 비어 있거나 찾을 수 없는 값은 null 또는 빈 배열로 둡니다.
 
 구조화 규칙:
+- jobs는 반드시 최소 1개 이상 채우세요. 모집분야가 하나뿐이어도 그 하나를 jobs[0]에
+  넣으세요 — 빈 배열로 두는 것은 오류입니다.
 - 모집분야/직무명이 여러 개면 반드시 jobs[]를 여러 개로 분리하세요.
 - 서로 다른 모집분야의 근무지·전공·자격요건·담당업무를 하나의 job에 합치지 마세요.
 - 표에서 같은 행 또는 같은 모집분야 블록에 있는 정보만 같은 job에 넣으세요.
 - department: 공고에 팀·본부·사업부명이 명시된 경우에만 원문 그대로 추출하세요. 회사의
   전반적인 업종/사업 설명으로 부서를 추측하지 마세요.
+- career: 지원자격 섹션 등에 "경력: 경력무관" 처럼 경력 요건 자체를 명시한 문구가 있으면
+  그 원문을 career 필드에 넣으세요. 이 문구를 tracks.newcomer.requirements나
+  tracks.experienced.requirements에도 중복해서 넣지 마세요 — career는 지원자격 자체,
+  tracks는 신입/경력 각 트랙에 추가로 요구되는 세부 조건입니다.
+- skills/core_competencies: 우대사항 문장과 별개로 "스킬"/"기술" 또는 "핵심역량"/"인재상" 같은
+  이름으로 태그·키워드 목록이 나열돼 있으면 각각 skills/core_competencies에 넣으세요. 이미
+  preferred_common이나 tracks.*.preferred에 넣은 항목을 여기 중복해서 넣지 마세요.
+
+제출서류 필수/선택 구분:
+- documents_required: "공통필수"처럼 반드시 제출해야 한다고 명시된 서류.
+- documents_optional: "해당선택"처럼 해당자만 내거나 선택적으로 제출하는 서류.
+- 필수/선택 구분이 원문에 없으면 documents_required에 넣으세요.
 
 우대사항 레벨 배정(불분명하면 더 공통적인 상위 레벨에 배치):
 - common.preferred: 공고 전체 모든 직무에 적용된다고 명확한 우대사항만.

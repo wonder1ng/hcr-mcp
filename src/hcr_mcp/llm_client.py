@@ -3,6 +3,7 @@ import functools
 from typing import Any, Callable, Coroutine, TypeVar
 
 import openai
+import pydantic
 import tiktoken
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import Runnable
@@ -74,12 +75,17 @@ def structured_chain(system: str, human: str, schema: type) -> Runnable:
 
 
 def _translate_openai_errors(fn: Callable[..., Coroutine[Any, Any, T]]) -> Callable[..., Coroutine[Any, Any, T]]:
-    """openai SDK 예외를 사용자가 바로 이해할 수 있는 한글 메시지로 변환."""
+    """openai SDK 예외 + 구조화 출력 검증 실패(pydantic.ValidationError)를 사용자가 바로
+    이해할 수 있는 한글 메시지로 변환. safe_ainvoke가 감싸는 structured_chain 호출에서, LLM
+    응답이 스키마 제약(예: min_length)을 못 채우면 openai 예외가 아니라 pydantic.ValidationError가
+    나서 별도로 잡아야 한다(실측: JobPosting.jobs에 min_length=1을 걸었을 때 이 경로로 확인)."""
 
     @functools.wraps(fn)
     async def wrapper(*args: Any, **kwargs: Any) -> T:
         try:
             return await fn(*args, **kwargs)
+        except pydantic.ValidationError as e:
+            raise HcrMcpError(f"LLM 응답이 예상한 형식과 맞지 않습니다: {e}") from e
         except openai.AuthenticationError as e:
             raise HcrMcpError(
                 "LLM API 키가 유효하지 않습니다. HCR_MCP_LLM_API_KEY 값을 확인하세요."

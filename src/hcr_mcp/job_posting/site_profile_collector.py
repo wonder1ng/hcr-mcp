@@ -95,7 +95,11 @@ async def _fetch_and_parse(url: str) -> dict | None:
     else:
         return await _llm_fallback_extract(html_to_text(html))
 
-    return result if _has_any_value(result) else await _llm_fallback_extract(html_to_text(html))
+    # raw_text는 항상 채워지는 안전망 필드라 _has_any_value 판단에서 제외한다 — 안 그러면
+    # 구조화 필드(basic_info/financial/history 등)가 전부 비어도 raw_text만으로 "성공"
+    # 판정돼 LLM 폴백(_llm_fallback_extract)이 영영 안 켜진다.
+    structured_only = {k: v for k, v in result.items() if k != "raw_text"}
+    return result if _has_any_value(structured_only) else await _llm_fallback_extract(html_to_text(html))
 
 
 async def collect_recruit_site_profile(

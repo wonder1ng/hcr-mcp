@@ -4,7 +4,7 @@ gamejob_company_info/jobkorea_company_info/super_company_info copy-adapt).
 이 모듈이 다루는 채용 사이트 기업정보는 공고 URL이 있는 한 항상 확보 가능한 base data다
 (DART/홈페이지/뉴스는 회사에 따라 없을 수 있다) — 다만 여기 포함된 CSS 셀렉터는 특정
 사이트(잡코리아/게임잡) 마크업에 맞춰져 있어 사이트 구조가 바뀌거나 다른 사이트면 파싱이
-실패할 수 있다. 그 경우를 위해 job_site_profile_collector.py가 URL 직접입력·스크린샷
+실패할 수 있다. 그 경우를 위해 site_profile_collector.py가 URL 직접입력·스크린샷
 비전추출 폴백을 둔다.
 
 원본 차이: 파싱 실패(AttributeError, 사이트 구조 변경 등) 시 디버그용 HTML 파일을

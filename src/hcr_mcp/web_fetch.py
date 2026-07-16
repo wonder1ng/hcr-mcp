@@ -1,4 +1,4 @@
-"""URL → HTML/정제된 텍스트. fit/job_collector.py와 company_report의 여러 콜렉터가 공유하는
+"""URL → HTML/정제된 텍스트. job_posting/collector.py와 company_report의 여러 콜렉터가 공유하는
 스크래핑 유틸 (사이트별 셀렉터는 이 모듈 밖 — 여기는 순수 fetch만 담당)."""
 
 import logging
@@ -14,7 +14,7 @@ _HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit
 
 
 async def fetch_page_html(url: str) -> str | None:
-    """원본 HTML 그대로. CSS 셀렉터 기반 파서(jobsite_parsers.py 등)가 쓴다."""
+    """원본 HTML 그대로. CSS 셀렉터 기반 파서(site_parsers.py 등)가 쓴다."""
     try:
         async with httpx.AsyncClient(headers=_HEADERS, timeout=10, follow_redirects=True) as client:
             resp = await client.get(url)

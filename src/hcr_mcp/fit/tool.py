@@ -1,6 +1,8 @@
+import json
 from typing import Literal
 
-from hcr_mcp.fit import job_collector, resume_collector, service
+from hcr_mcp.fit import resume_collector, service
+from hcr_mcp.job_posting import collector as job_posting_collector
 from hcr_mcp.server import get_storage, mcp
 
 
@@ -19,13 +21,14 @@ async def analyze_fit(
     함께 반영해 기업 적합도까지 분석합니다 — 없어도 직무 적합도 분석은 정상 동작합니다.
     """
     candidate_doc = await resume_collector.parse_resume(resume_path)
-    job_doc_text = await job_collector.collect_job_posting(job_title, job_url, job_screenshot_paths)
+    posting = await job_posting_collector.collect_job_posting(job_title, get_storage(), job_url, job_screenshot_paths)
+    job_doc_json = json.dumps({"target_job_title": job_title, **posting.model_dump()}, ensure_ascii=False)
 
     company_report = None
     if company_name:
         company_report = get_storage().latest_report("company_report", company_name)
 
-    result = await service.analyze_fit(candidate_doc, job_doc_text, company_report)
+    result = await service.analyze_fit(candidate_doc, job_doc_json, company_report)
 
     saved_path = get_storage().save_report("fit", company_name or job_title, result, storage_level)
     if saved_path:

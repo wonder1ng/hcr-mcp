@@ -124,6 +124,7 @@ async def safe_ainvoke(runnable: Runnable, inputs: dict[str, Any]) -> Any:
 
 
 _EMBED_MAX_TOKENS_PER_REQUEST = 250_000  # OpenAI 실제 요청 한도(300k 토큰)보다 여유를 둔 안전선
+_EMBED_MAX_TOKENS_PER_INPUT = 8192  # OpenAI 임베딩 모델의 단일 input 하드 한도(요청 전체 한도와 별개)
 _EMBED_ENCODING = "cl100k_base"  # text-embedding-3-* 계열이 쓰는 인코딩(tiktoken 공식 매핑 기준)
 
 
@@ -137,15 +138,22 @@ def _batch_by_token_limit(texts: list[str], max_tokens: int) -> list[list[str]]:
     여전히 한도를 넘길 수 있다. tiktoken 인코딩 비용(텍스트당 수백 마이크로초)은 API 왕복
     시간(수백 ms~수 초)에 비해 무시할 수준이라 정확히 세는 쪽을 택했다.
 
-    ponytail: 텍스트 하나가 그 자체로 max_tokens를 넘으면 그 하나만 담은 배치로 분리되지만
-    여전히 요청은 실패한다 — 실측 기사 본문 최대치(8,143 토큰)가 이 상한의 3% 수준이라 현재는
-    발생하지 않지만, 발생하면 해당 텍스트를 잘라 보내는 로직이 필요하다."""
+    텍스트 하나가 그 자체로 단일 input 한도(_EMBED_MAX_TOKENS_PER_INPUT)를 넘으면 그 텍스트만
+    앞부분 8192토큰으로 잘라서 보낸다(다른 텍스트는 영향 없음) — 실측(2026-07-17, ㈜윕스 산업
+    뉴스 dedup)으로 발생 확인: 8,192 토큰을 넘는 기사가 실제로 있었고, 이전엔 이 경우 배치
+    분할과 무관하게 요청 자체가 실패했다. 이 잘림은 dedup 유사도 계산에만 쓰이는 임시 문자열에만
+    적용되고(호출부의 원본 article 데이터는 그대로) — 근접중복 판단이 목적이라 기사 서두만으로
+    충분(원문 저장·이후 그룹핑/요약은 원문 그대로 사용)."""
     enc = tiktoken.get_encoding(_EMBED_ENCODING)
     batches: list[list[str]] = []
     current: list[str] = []
     current_tokens = 0
     for text in texts:
-        n = len(enc.encode(text))
+        tokens = enc.encode(text)
+        if len(tokens) > _EMBED_MAX_TOKENS_PER_INPUT:
+            tokens = tokens[:_EMBED_MAX_TOKENS_PER_INPUT]
+            text = enc.decode(tokens)
+        n = len(tokens)
         if current and current_tokens + n > max_tokens:
             batches.append(current)
             current, current_tokens = [], 0

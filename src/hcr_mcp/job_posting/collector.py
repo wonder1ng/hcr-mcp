@@ -25,13 +25,13 @@ from hcr_mcp import llm_client
 from hcr_mcp.job_posting.prompts import JOB_POSTING_HUMAN, JOB_POSTING_SYSTEM
 from hcr_mcp.job_posting.schemas import JobPosting
 from hcr_mcp.storage import Storage
-from hcr_mcp.web_fetch import fetch_page_text
+from hcr_mcp.web_fetch import fetch_page_html, fetch_page_text, html_to_text
 
 logger = logging.getLogger("hcr_mcp.job_posting.collector")
 
 _MIN_USEFUL_CHARS = 200  # 이보다 짧으면 JS 렌더링/차단으로 보고 스크린샷 폴백을 권장
 _DEADLINE_RE = re.compile(r"(20\d{2})[-./년]\s*(\d{1,2})[-./월]\s*(\d{1,2})")
-_JOBKOREA_HOSTS = {"jobkorea.co.kr", "www.jobkorea.co.kr"}
+_JOBKOREA_HOSTS = {"jobkorea.co.kr", "www.jobkorea.co.kr", "m.jobkorea.co.kr"}
 _JOBKOREA_GI_READ_PATH_RE = re.compile(r"^/Recruit/GI_Read/(\d+)$")
 
 
@@ -47,23 +47,36 @@ def _jobkorea_detail_url(url: str) -> str | None:
     return f"https://www.jobkorea.co.kr/Recruit/GI_Read_Comt_Ifrm?Gno={m.group(1)}" if m else None
 
 
+_NO_JOB_TITLE_HINT = "(미지정 — 공고에 있는 모든 모집분야를 jobs[]에 각각 빠짐없이 추출하세요)"
+
+
 async def collect_job_posting(
-    job_title: str,
+    job_title: str | None,
     storage: Storage,
     url: str | None = None,
     screenshot_paths: list[str | Path] | None = None,
 ) -> JobPosting:
     """공고 원문을 스크래핑/비전 추출로 모아 구조화한다. URL 스크래핑과 스크린샷 중
-    아무것도 성공하지 못해도 job_title만으로 최소한의 구조를 반환한다(하드 실패 없음)."""
+    아무것도 성공하지 못해도 job_title만으로 최소한의 구조를 반환한다(하드 실패 없음).
+
+    job_title이 None이면(호출자가 어떤 모집분야를 지원할지 아직 모르는 경우) 저장 키로
+    "직무명_미지정"을 쓴다 — jobs[]가 여러 개로 파싱되면 호출자(fit/tool.py)가 그 목록을
+    사용자에게 보여주고 하나를 골라 job_title로 다시 호출해야 하는데, 그 시점엔 아직 이
+    공고의 최종 job_title이 없기 때문."""
     parts = []
     vision_used = False
 
     if url:
-        scraped = await fetch_page_text(url)
+        fetched = await fetch_page_html(url)
+        scraped = html_to_text(fetched[0]) if fetched else None
         if scraped and len(scraped) >= _MIN_USEFUL_CHARS:
             parts.append(f"[공고 원문 (URL: {url})]\n{scraped}")
 
-        detail_url = _jobkorea_detail_url(url)
+        # 잡코리아 판별은 리다이렉트를 다 따라간 최종 URL 기준(fetched[1])으로 한다 — 원본 url
+        # 그대로 판별하면 URL 단축 서비스(joburl.kr 등)를 거친 입력에서 실제 도착지가
+        # 잡코리아여도 상세 본문 iframe 트릭이 안 걸린다(실측 확인).
+        final_url = fetched[1] if fetched else url
+        detail_url = _jobkorea_detail_url(final_url)
         detail_text = await fetch_page_text(detail_url) if detail_url else None
         if detail_text:
             parts.append(f"[공고 상세 본문 (URL: {detail_url})]\n{detail_text}")
@@ -79,11 +92,14 @@ async def collect_job_posting(
         parts.append(f"[스크린샷에서 추출한 공고 내용]\n{extracted}")
         vision_used = True
 
+    storage_key = job_title or "직무명_미지정"
     posting_text = "\n\n".join(parts)
-    storage.save_raw("job_posting", job_title, "raw_text.txt", posting_text.encode("utf-8"))
+    storage.save_raw("job_posting", storage_key, "raw_text.txt", posting_text.encode("utf-8"))
 
     chain = llm_client.structured_chain(JOB_POSTING_SYSTEM, JOB_POSTING_HUMAN, JobPosting)
-    posting: JobPosting = await llm_client.safe_ainvoke(chain, {"job_title": job_title, "posting_text": posting_text})
+    posting: JobPosting = await llm_client.safe_ainvoke(
+        chain, {"job_title": job_title or _NO_JOB_TITLE_HINT, "posting_text": posting_text}
+    )
 
     posting.raw_meta.source_url = url
     posting.raw_meta.vision_used = vision_used
@@ -91,7 +107,7 @@ async def collect_job_posting(
     _apply_deadline_fallback(posting, posting_text)
     _warn_identical_tracks(posting)
 
-    storage.save_report("job_posting", job_title, posting.model_dump())
+    storage.save_report("job_posting", storage_key, posting.model_dump())
     return posting
 
 

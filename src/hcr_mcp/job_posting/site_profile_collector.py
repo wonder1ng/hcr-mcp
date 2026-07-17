@@ -84,9 +84,10 @@ def _find_company_link(html: str, base_url: str) -> str | None:
 
 
 async def _fetch_and_parse(url: str) -> dict | None:
-    html = await fetch_page_html(url)
-    if not html:
+    fetched = await fetch_page_html(url)
+    if not fetched:
         return None
+    html, _final_url = fetched
 
     if "gamejob" in url:
         result = site_parsers.gamejob_company_info(html)
@@ -112,7 +113,8 @@ async def collect_recruit_site_profile(
         if result:
             return result
 
-    posting_html = await fetch_page_html(job_posting_url)
+    fetched = await fetch_page_html(job_posting_url)
+    posting_html = fetched[0] if fetched else None
     if posting_html:
         company_url = _find_company_link(posting_html, job_posting_url)
         if company_url:

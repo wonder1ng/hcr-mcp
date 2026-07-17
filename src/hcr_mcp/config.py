@@ -1,12 +1,9 @@
 from pathlib import Path
-from typing import Literal
 
 from pydantic import ValidationError
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from hcr_mcp.errors import HcrMcpError
-
-StorageLevel = Literal["none", "results", "raw"]
 
 
 class Settings(BaseSettings):
@@ -20,7 +17,6 @@ class Settings(BaseSettings):
     dart_api_key: str | None = None
 
     data_dir: Path = Path.home() / ".hcr-mcp" / "data"
-    default_storage_level: StorageLevel = "results"
 
 
 def load_settings() -> Settings:

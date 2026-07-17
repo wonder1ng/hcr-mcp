@@ -4,12 +4,14 @@ gamejob_company_info/jobkorea_company_info/super_company_info copy-adapt).
 이 모듈이 다루는 채용 사이트 기업정보는 공고 URL이 있는 한 항상 확보 가능한 base data다
 (DART/홈페이지/뉴스는 회사에 따라 없을 수 있다) — 다만 여기 포함된 CSS 셀렉터는 특정
 사이트(잡코리아/게임잡) 마크업에 맞춰져 있어 사이트 구조가 바뀌거나 다른 사이트면 파싱이
-실패할 수 있다. 그 경우를 위해 job_site_profile_collector.py가 URL 직접입력·스크린샷
+실패할 수 있다. 그 경우를 위해 site_profile_collector.py가 URL 직접입력·스크린샷
 비전추출 폴백을 둔다.
 
 원본 차이: 파싱 실패(AttributeError, 사이트 구조 변경 등) 시 디버그용 HTML 파일을
 디스크에 남기던 부분을 제거하고 조용히 부분/빈 결과를 반환.
 """
+
+import re
 
 from bs4 import BeautifulSoup
 
@@ -64,12 +66,22 @@ def gamejob_company_info(html: str) -> dict:
 
 
 def jobkorea_company_info(html: str) -> dict:
-    result: dict = {"basic_info": {}, "financial": {}, "history": [], "employment": {}, "benefits": {}, "location": {}}
+    result: dict = {
+        "basic_info": {}, "financial": {}, "history": [], "employment": {}, "benefits": {}, "location": {},
+        "raw_text": "",
+    }
 
     soup = BeautifulSoup(html, "html.parser")
     soup = soup.select_one("div.company-body-infomation")
     if soup is None:
         return result
+
+    # 회사마다 마크업이 조금씩 다르고(실측: 같은 "연혁" 섹션도 회사에 따라 아래 구조화 셀렉터가
+    # 맞는 곳도, #devJKhistory처럼 <br>로만 구분된 텍스트 블록인 곳도 있음) CSS 셀렉터가 계속
+    # site 개편을 따라가지 못할 수 있어, 구조화 파싱과 별개로 이 컨테이너 전체 텍스트도 원문
+    # 그대로 함께 남긴다 — 구조화 필드가 놓친 내용이 있어도(예: 셀렉터가 안 맞는 섹션) LLM이
+    # 이 raw_text로 보완할 수 있게. mutate 전(위 <br> 치환 등 영향 없게) 여기서 먼저 캡처.
+    result["raw_text"] = "\n".join(line.strip() for line in soup.get_text("\n").splitlines() if line.strip())
 
     basic_table = soup.select_one("table.table-basic-infomation-primary")
     if basic_table:
@@ -116,6 +128,27 @@ def jobkorea_company_info(html: str) -> dict:
                     "events": [x.get_text(strip=True) for x in item.select(".month-description")],
                 }
             )
+
+    # 위 .year/.month/.month-description 구조가 없는 회사는(실측: #devJKhistory) 연혁이
+    # "2022년<br>- 항목<br>- 항목<br><br>2021년<br>..." 형태의 텍스트 블록 하나로만 들어있다.
+    # 두 구조 다 위 루프처럼 각자 셀렉터가 없으면 그냥 빈 채로 넘어가므로 병행해도 중복되지 않음.
+    history_block = soup.select_one("#devJKhistory")
+    if history_block:
+        for br in history_block.find_all("br"):
+            br.replace_with("\n")
+        current_year, events = None, []
+        for line in (l.strip() for l in history_block.get_text().split("\n")):
+            if not line:
+                continue
+            year_match = re.match(r"^(\d{4})년$", line)
+            if year_match:
+                if current_year and events:
+                    result["history"].append({"year": current_year, "events": events})
+                current_year, events = year_match.group(1), []
+            else:
+                events.append(line.lstrip("- ").strip())
+        if current_year and events:
+            result["history"].append({"year": current_year, "events": events})
 
     recruitments = []
     for row in soup.select(".table-in-progress-announcement tbody tr"):

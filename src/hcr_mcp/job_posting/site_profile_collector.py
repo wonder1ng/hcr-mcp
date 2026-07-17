@@ -3,7 +3,7 @@
 3단계 폴백:
   1. company_info_url이 주어지면 그 페이지부터 직접 파싱 시도(링크 추출 단계 생략).
   2. job_posting_url에서 기업정보 페이지 링크를 찾아 이동해 파싱.
-     (1),(2) 모두 사이트별 파서(jobsite_parsers.py, 잡코리아/게임잡)를 먼저 시도하고,
+     (1),(2) 모두 사이트별 파서(site_parsers.py, 잡코리아/게임잡)를 먼저 시도하고,
      인식 못 하는 사이트거나 셀렉터가 안 맞으면 그 페이지 텍스트를 LLM 일반 추출로 보완.
   3. 위 두 가지 모두 실패하면(비공개·차단 등) company_info_screenshot_paths를 비전 LLM으로 추출.
 """
@@ -16,7 +16,7 @@ from urllib.parse import urljoin
 from bs4 import BeautifulSoup
 
 from hcr_mcp import llm_client
-from hcr_mcp.company_report import jobsite_parsers
+from hcr_mcp.job_posting import site_parsers
 from hcr_mcp.web_fetch import fetch_page_html, html_to_text
 
 _LLM_SYSTEM_PROMPT = """당신은 채용/기업 사이트 페이지에서 기업정보만 추출하는 전문가입니다.
@@ -89,13 +89,17 @@ async def _fetch_and_parse(url: str) -> dict | None:
         return None
 
     if "gamejob" in url:
-        result = jobsite_parsers.gamejob_company_info(html)
+        result = site_parsers.gamejob_company_info(html)
     elif "jobkorea.co.kr" in url:
-        result = jobsite_parsers.super_company_info(html) if "jobkorea.co.kr/super/" in html[:2000] else jobsite_parsers.jobkorea_company_info(html)
+        result = site_parsers.super_company_info(html) if "jobkorea.co.kr/super/" in html[:2000] else site_parsers.jobkorea_company_info(html)
     else:
         return await _llm_fallback_extract(html_to_text(html))
 
-    return result if _has_any_value(result) else await _llm_fallback_extract(html_to_text(html))
+    # raw_text는 항상 채워지는 안전망 필드라 _has_any_value 판단에서 제외한다 — 안 그러면
+    # 구조화 필드(basic_info/financial/history 등)가 전부 비어도 raw_text만으로 "성공"
+    # 판정돼 LLM 폴백(_llm_fallback_extract)이 영영 안 켜진다.
+    structured_only = {k: v for k, v in result.items() if k != "raw_text"}
+    return result if _has_any_value(structured_only) else await _llm_fallback_extract(html_to_text(html))
 
 
 async def collect_recruit_site_profile(

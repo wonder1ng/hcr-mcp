@@ -184,8 +184,22 @@ async def extract_info_with_llm(company_name: str, webpage_text: str, website_ur
     return result
 
 
+_ENTITY_ONLY_RE = re.compile(r"\(주\)|㈜|주식회사|\(유\)|유한회사|\(사\)|사단법인|\(재\)|재단법인")
+_ENTITY_PREFIX_RE = re.compile(_ENTITY_ONLY_RE.pattern + r"|\s+")
+
+
+def strip_entity_prefix(name: str) -> str:
+    """검색 쿼리 등에 쓰기 위해 법인 형태 표기(㈜/주식회사/(유)/유한회사/(사)/사단법인/(재)/
+    재단법인)만 제거한다 — 공백·대소문자는 그대로 유지(순수 표기 정리용, 검색어 가독성을
+    해치지 않음). 전체 정규화(공백 제거+소문자화, 동일 회사 판별용)가 필요하면 _normalize_name.
+    회사명을 그대로 검색 쿼리에 넣으면 법인 표기 차이(㈜윕스 vs 윕스)로 검색 결과가 갈릴 수
+    있어(실측은 네이버에서는 차이 없었지만, 다른 검색 소스·LLM web_search에서는 보장 안 됨)
+    모든 검색 쿼리 구성 지점에서 이 함수로 정리한 이름을 쓴다."""
+    return re.sub(r"\s+", " ", _ENTITY_ONLY_RE.sub("", name or "")).strip()
+
+
 def _normalize_name(s: str) -> str:
-    return re.sub(r"\(주\)|㈜|주식회사|\(유\)|유한회사|\s+", "", s or "").lower()
+    return _ENTITY_PREFIX_RE.sub("", s or "").lower()
 
 
 def _name_appears_in_text(company_name: str, text: str) -> bool:

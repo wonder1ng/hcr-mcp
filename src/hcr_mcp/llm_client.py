@@ -214,6 +214,30 @@ async def web_search(query: str) -> str:
     return resp.output_text
 
 
+class _WebSearchListResult(pydantic.BaseModel):
+    items: list[str] = pydantic.Field(description="검색 결과 텍스트에 실제로 등장한 항목만(추측 금지)")
+
+
+async def web_search_extract_list(query: str, extraction_system_prompt: str) -> list[str]:
+    """web_search로 검색한 뒤, 그 결과 텍스트에서 항목 목록만 구조화 추출한다(2단계 호출 —
+    web_search 도구 호출과 구조화 출력을 한 번에 강제하는 건 신뢰성이 떨어져, 이미
+    competitor_finder.py가 쓰던 '검색 → 별도 호출로 구조화' 패턴을 공용화했다). 검색/추출 중
+    무엇이 실패해도 예외를 던지지 않고 빈 리스트를 반환한다 — 이 함수의 결과는 항상 발견
+    후보를 넓히는 보조 소스이지 필수 경로가 아니다."""
+    try:
+        text = await web_search(query)
+    except Exception:  # noqa: BLE001 — 검색 실패는 조용히 빈 결과로(보조 소스)
+        return []
+    if not text:
+        return []
+    chain = structured_chain(extraction_system_prompt, "검색 결과:\n{text}", _WebSearchListResult)
+    try:
+        result: _WebSearchListResult = await safe_ainvoke(chain, {"text": text})
+    except Exception:  # noqa: BLE001 — 추출 실패도 조용히 빈 결과로
+        return []
+    return result.items
+
+
 _CHECK_LABELS = {
     "chat": "채팅 모델",
     "embedding": "임베딩 모델",

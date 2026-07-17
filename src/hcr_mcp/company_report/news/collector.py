@@ -47,6 +47,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from pydantic import BaseModel, Field
 
 from hcr_mcp import llm_client, net
+from hcr_mcp.company_report.company_profile_collector import strip_entity_prefix
 from hcr_mcp.company_report.news import event_taxonomy
 
 _HEADERS = {
@@ -777,6 +778,68 @@ async def _finalize_issues(issues: list[dict]) -> tuple[list[dict], list[dict]]:
     return topics, raw_issues
 
 
+async def _candidate_articles(candidate: str) -> list[dict]:
+    """후보(경쟁사명/트렌드 키워드) 하나에 대해 네이버 뉴스검색(최근 1페이지, 가벼운 단발 조회
+    — competitor_finder.py의 기존 _naver_page1과 동일한 성격) + LLM web_search를 병렬로 실행해
+    기사 형태로 합친다. 둘 중 하나가 실패해도 다른 하나로 계속 진행 — 후보 하나의 검색 실패가
+    전체 수집을 막지 않는다(보조 정보 성격). candidate는 검색 쿼리 구성 전 법인 표기를
+    제거한다(strip_entity_prefix — 모든 검색 쿼리 구성 지점에서 공통 적용)."""
+    candidate = strip_entity_prefix(candidate)
+
+    async def _naver() -> list[dict]:
+        async with httpx.AsyncClient(follow_redirects=True) as client:
+            try:
+                resp = await client.get(
+                    _SEARCH_URL,
+                    params={"query": candidate, "ssc": "tab.news.all", "sm": "tab_opt", "start": "1"},
+                    headers=_HEADERS, timeout=_REQUEST_TIMEOUT,
+                )
+                resp.raise_for_status()
+            except httpx.HTTPError as e:
+                net.raise_if_ssl_trust_error(e)
+                return []
+        return _parse_search_page(resp.text)
+
+    naver_result, web_result = await asyncio.gather(_naver(), llm_client.web_search(candidate), return_exceptions=True)
+    naver_articles = naver_result if isinstance(naver_result, list) else []
+    web_text = web_result if isinstance(web_result, str) else ""
+
+    articles = [{**a, "body": a.get("snippet") or ""} for a in naver_articles]
+    if web_text:
+        articles.append(
+            {
+                "title": f"{candidate} 웹검색 요약", "url": None, "naver_url": None, "press": "web_search",
+                "date": date.today().isoformat(), "snippet": web_text[:500], "body": web_text,
+            }
+        )
+    return articles
+
+
+async def _candidate_issues(candidates: list[str]) -> list[dict]:
+    """후보 목록(경쟁사명, 트렌드 키워드 등) 각각에 대해 병렬로 자료를 모아 (finalize 전) raw
+    이슈 목록으로 만든다. 후보는 이미 서로 다른 개별 주제로 확정된 상태라(예: 경쟁사 A/B/C)
+    _group_and_dedup의 근접중복 병합·LLM 그룹핑 단계는 필요 없다 — 후보 하나 = 이슈 하나."""
+    if not candidates:
+        return []
+    per_candidate = await asyncio.gather(*[_candidate_articles(c) for c in candidates])
+    return [
+        {"issue_title": candidate, "occurred_month": date.today().strftime("%Y-%m"), "articles": arts}
+        for candidate, arts in zip(candidates, per_candidate) if arts
+    ]
+
+
+async def collect_candidate_topics(
+    candidates: list[str], on_raw_ready: Callable[[list[dict]], None]
+) -> tuple[list[dict], list[dict]]:
+    """_candidate_issues를 기업 뉴스와 같은 형태(gist+event_id+중요도)로 토픽 정리해 반환하는
+    독립 호출용 진입점(competitor_finder.py가 사용). on_raw_ready: 후보별 자료 수집 직후 즉시
+    호출(의무 저장 — 다른 collect_* 함수와 동일 패턴)."""
+    issues = await _candidate_issues(candidates)
+    if issues:
+        on_raw_ready([a for i in issues for a in i["articles"]])
+    return await _finalize_issues(issues)
+
+
 def _months_ago(d: date, months: int) -> date:
     month_index = d.month - 1 - months
     year = d.year + month_index // 12
@@ -946,7 +1009,10 @@ async def _collect_issues(
 def _company_query_variants(company_name: str, ceo_name: str | None) -> list[str]:
     """채용공고를 올린 회사(=검색 노이즈가 실제로 문제되는 대상) 검색 시, 결과가 노이즈로
     판정되면 순서대로 시도할 더 구체적인 검색어. Naver는 큰따옴표를 정확일치 문법으로 존중하지
-    않지만(실증 확인됨), "기업"/대표명을 추가 검색어로 넣는 것 자체는 실제로 결과를 좁혀준다."""
+    않지만(실증 확인됨), "기업"/대표명을 추가 검색어로 넣는 것 자체는 실제로 결과를 좁혀준다.
+    company_name은 검색 쿼리에 넣기 전 법인 표기(㈜/주식회사 등)를 제거한다(strip_entity_prefix
+    참고 — 모든 검색 쿼리 구성 지점에서 공통 적용)."""
+    company_name = strip_entity_prefix(company_name)
     variants = [f'"{company_name}"', f'기업 "{company_name}"']
     if ceo_name:
         variants.append(f'"{company_name}" "{ceo_name}"')
@@ -971,9 +1037,15 @@ async def collect_recent_issues(
 
     on_raw_ready: _collect_issues 참고 — 필수 인자(의무 저장), 생략 불가.
     """
+    # display_keyword는 _filter_unrelated_issues에서 "keyword in 기사 제목/본문" 순수 문자열
+    # 포함 검사로도 쓰인다 — company_name을 법인 표기(㈜ 등) 그대로 넘기면, 실제 기사 대부분이
+    # "㈜윕스"가 아니라 "윕스"라고만 써서 이 결정론적 필터가 진짜 관련 이슈까지 통째로 탈락시킨다
+    # (실측: "윕스"로 그룹핑하면 이슈 그룹 31개, "㈜윕스"로 하면 훨씬 적게 나옴 — 예: 최근 CEO
+    # 단독대표 체제 전환 기사가 이 필터에서 탈락). strip_entity_prefix로 정리한 이름을 쓴다.
+    display_keyword = strip_entity_prefix(company_name)
     issues: list[dict] = []
     for query in _company_query_variants(company_name, ceo_name):
-        issues, noisy = await _collect_issues(query, "company", on_raw_ready, display_keyword=company_name)
+        issues, noisy = await _collect_issues(query, "company", on_raw_ready, display_keyword=display_keyword)
         if not noisy:
             break
     return await _finalize_issues(issues)
@@ -989,12 +1061,53 @@ async def collect_industry_trend(
     return await _finalize_issues(issues)
 
 
+_JOB_TREND_KEYWORD_PROMPT = (
+    '"{job_title}" 직무와 관련된 최근 트렌드/이슈 키워드만 목록으로 뽑으세요'
+    "(직무명 자체는 제외, 구체적인 트렌드 주제명만 — 예: 'AI 개발자'가 아니라 '생성형 AI 도입',"
+    " 'RAG 파이프라인' 같은 세부 주제)."
+)
+
+_JOB_TREND_DISCOVERY_SUFFIXES = ["최신 트렌드", "최신 이슈", "트렌드 모음", "이슈 모음"]  # 표현을 바꿔가며
+    # 여러 번 검색 — 한 표현으로는 web_search가 못 찾는 키워드를 다른 표현이 찾아내는 걸 실측
+    # 확인(경쟁사 넓은 질의에서 "기업"/"기업 리스트" 표현 차이로 결과가 갈린 것과 같은 이유).
+
+
 async def collect_job_trend(
     job_title: str, on_raw_ready: Callable[[list[dict]], None]
 ) -> tuple[list[dict], list[dict]]:
     """직무 관련 최근 트렌드·이슈 목록 (fit이 사용 — company_report가 job_title을 받았을 때
     미리 수집해 job_trend로 캐시해두면 fit이 재수집 없이 가져다 쓴다).
+
+    직접 검색(job_title 자체로 다년간 뉴스 검색, _collect_issues)과 트렌드 키워드 발견 검색
+    (_JOB_TREND_DISCOVERY_SUFFIXES의 각 표현으로 "한국 {job_title} {표현}"을 병렬로 LLM
+    web_search, 찾아낸 세부 키워드별로 다시 병렬 심화 수집 — collect_candidate_topics와 동일한
+    _candidate_issues)을 동시에 실행해 합친다 — 후자는 job_title 자체를 검색해서는 잘 안 잡히는
+    세부 트렌드 주제를 보완한다. 쿼리 앞에 "한국"을 붙이는 이유: LLM 내장 web_search가 기본적으로
+    미국/글로벌 기준 결과를 우선할 수 있어(실측: "한국" 없이 검색하면 국내와 무관한 결과가 섞여
+    나옴), 국내 채용시장 기준으로 좁힌다.
+
     반환: (토픽별로 묶인 이슈 목록(event_taxonomy.py 기준, gist+출처+중요도), 원문 보존본(본문 포함, 저장 전용)).
-    on_raw_ready: _collect_issues 참고 — 필수 인자(의무 저장), 생략 불가."""
-    issues, _ = await _collect_issues(job_title, "job", on_raw_ready)
-    return await _finalize_issues(issues)
+    on_raw_ready: _collect_issues/_candidate_issues 참고 — 필수 인자(의무 저장), 생략 불가."""
+    discovery_prompt = _JOB_TREND_KEYWORD_PROMPT.format(job_title=job_title)
+    discovery_tasks = [
+        llm_client.web_search_extract_list(f"한국 {job_title} {suffix}", discovery_prompt)
+        for suffix in _JOB_TREND_DISCOVERY_SUFFIXES
+    ]
+    *keyword_lists, (direct_issues, _) = await asyncio.gather(
+        *discovery_tasks,
+        _collect_issues(job_title, "job", on_raw_ready),
+    )
+
+    seen: set[str] = set()
+    trend_keywords: list[str] = []
+    for keywords in keyword_lists:
+        for kw in keywords:
+            if kw not in seen:
+                seen.add(kw)
+                trend_keywords.append(kw)
+
+    candidate_issues = await _candidate_issues(trend_keywords)
+    if candidate_issues:
+        on_raw_ready([a for i in candidate_issues for a in i["articles"]])
+
+    return await _finalize_issues(direct_issues + candidate_issues)

@@ -8,9 +8,8 @@
   이 값을 구분할 이유가 있었지만, 이 collector는 그 두 경로가 없다(실패 시 예외로 전체 호출이
   실패, 부분 레코드를 만들어 저장하지 않음) — 저장된 레코드는 항상 LLM 성공을 의미해 이 필드가
   결과에 아무 정보도 더하지 않는다(실측: 항상 LLM이 임의로 채운 값만 나옴, 신뢰 불가).
-- jobs를 required(min_length=1)로 강제: 원본은 required였는데 처음 포팅할 때 실수로
-  default_factory=list를 줘서 LLM이 빈 배열을 반환해도 검증을 통과하게 열려 있었다 — jobs[]가
-  공고의 핵심 데이터(무슨 직무인지)라 빈 배열은 그 자체로 오류로 취급해야 한다.
+- jobs: prompts.py에 "모집분야가 하나뿐이어도 리스트로 반환" + "내용이 전혀 없으면 빈 배열"
+  두 규칙을 프롬프트 레벨로만 강제한다.
 - 신규: jobs[].department — 공고에 언급된 팀/본부/사업부명을 원문 그대로 추출(부서→사업분야
   매핑은 안 함, industry_keyword.py 몫). 없으면 null.
 - 신규: jobs[].career — 지원자격 섹션 등에 명시된 경력 요건 원문(예: "경력무관"). 원본
@@ -120,8 +119,8 @@ class JobPosting(BaseModel):
     source_url: str | None = None
     common: JobCommon
     jobs: list[JobEntry] = Field(
-        min_length=1,
-        description="모집분야별로 분리된 직무 목록. 모집분야가 하나뿐이어도 그 하나를 반드시 포함(빈 배열 금지)",
+        description="모집분야별로 분리된 직무 목록. 모집분야가 하나뿐이어도 그 하나를 반드시 포함"
+        "(원문에 파싱할 내용이 전혀 없을 때만 빈 배열)"
     )
     process: list[str] | None = Field(None, description="전형 절차")
     work_conditions: WorkConditions

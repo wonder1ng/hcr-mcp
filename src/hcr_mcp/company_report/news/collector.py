@@ -794,15 +794,21 @@ async def _finalize_issues(issues: list[dict]) -> tuple[list[dict], list[dict]]:
     return topics, raw_issues
 
 
-async def _naver_search_page1(client: httpx.AsyncClient, query: str) -> list[dict]:
+async def _naver_search_page1(client: httpx.AsyncClient, query: str, sort: str | None = None) -> list[dict]:
     """네이버 뉴스검색 1페이지(페이지네이션·기간 필터 없음, 가벼운 단발 조회)만.
     _fetch_search_page와 동일하게 전송 실패는 랜덤 대기 후 무한 재시도한다 — 실측 확인
     (2026-07-22): 후보 여러 개를 동시에 검색하면(예: 경쟁사 후보 46개 asyncio.gather) 네이버가
     봇으로 감지해 요청의 절반 이상을 403으로 차단한다(무작위로 걸려서 정상 후보 데이터가
     조용히 빈 값이 됨 — 경쟁사 검증 단계가 이 빈 값을 "근거 부족"으로 오판해 실제 경쟁사를
     걸러내는 사고로 이어짐). 그래서 호출자가 반드시 후보를 순차로(직렬) 호출해야 하고, 이
-    함수 자체도 그 전제 위에서 실패를 조용히 삼키지 않고 재시도한다."""
+    함수 자체도 그 전제 위에서 실패를 조용히 삼키지 않고 재시도한다.
+
+    sort: 생략하면 기존 호출부와 동일한 네이버 기본 정렬. 소송/판결 등 관련도가 중요한 보조
+    검색은 "0"(관련도순)을 명시적으로 넘긴다(사용자 제공 레퍼런스 URL로 확인) — "1"(최신순)은
+    날짜 구간 검색(_date_range_params) 전용이라 여기선 안 씀."""
     params = {"query": query, "ssc": "tab.news.all", "sm": "tab_opt", "start": "1"}
+    if sort is not None:
+        params["sort"] = sort
     while True:
         try:
             resp = await client.get(_SEARCH_URL, params=params, headers=_HEADERS, timeout=_REQUEST_TIMEOUT)
@@ -939,6 +945,26 @@ def _filter_unrelated_issues(keyword: str, subject_kind: str, issue_groups: list
     ]
 
 
+_LITIGATION_QUERY_TEMPLATES = ['{name} 소송', '{name} 판결', '기업 "{name}" 소송', '기업 "{name}" 판결']
+
+
+async def _collect_litigation_articles(client: httpx.AsyncClient, company_name: str, seen_urls: set[str]) -> list[dict]:
+    """소송/판결 관련 기사를 관련도순(sort="0")으로 보조 수집한다(사용자 제안, 2026-07-23) —
+    일반 회사명 검색(날짜 구간+최신순)은 소송·판결처럼 화제성이 약한 기사가 순위 밖으로 밀려
+    누락될 수 있음(실측 확인: ㈜윕스↔워트인텔리전스 간 "명예훼손" 소송 기사가 일반 검색에서
+    안 잡힘). 네이버 동시 요청 차단을 피하려 쿼리 4개를 순차로 조회한다(_naver_search_page1
+    참고). 반환은 title/url/snippet/press/date만 있는 검색 결과(본문 미포함) — 호출자가 기존
+    파이프라인과 동일하게 관련성 필터 후 본문을 붙인다."""
+    articles: list[dict] = []
+    for template in _LITIGATION_QUERY_TEMPLATES:
+        for a in await _naver_search_page1(client, template.format(name=company_name), sort="0"):
+            if a["url"] in seen_urls:
+                continue
+            seen_urls.add(a["url"])
+            articles.append(a)
+    return articles
+
+
 async def _group_and_dedup(keyword: str, subject_kind: str, articles: list[dict]) -> list[list[dict]]:
     """근접 중복 사전 병합(_dedup_cluster_by_embedding) → LLM 그룹핑(대표 기사만 대상) → 원래
     클러스터로 확장 → 회사 이슈는 결정론적 무관 기사 필터까지 적용한 최종 이슈 그룹."""
@@ -986,6 +1012,19 @@ async def _collect_issues(
         selected: list[list[dict]] = []
         found_count = 0     # 관련성 필터 이전, 검색으로 실제 찾은 기사 수(누적) — "검색 결과 자체가 없음" 판단용
         relevant_count = 0  # 관련성 필터 통과 기사 수(누적) — 노이즈 비율 계산용(임베딩/그룹핑 완료를 기다릴 필요 없음)
+
+        if subject_kind == "company":
+            # 날짜 구간 라운드보다 먼저 한 번만 실행 — 이 기사들도 같은 articles 풀에 합류해서
+            # _group_and_dedup의 임베딩 기반 근접중복 병합이 일반 검색과 겹치는 기사를 자동으로
+            # 하나로 합쳐준다(별도 병합 로직 불필요).
+            litigation_raw = await _collect_litigation_articles(client, display_keyword, seen_urls)
+            if litigation_raw:
+                litigation_raw = await _filter_relevant(display_keyword, subject_kind, litigation_raw)
+            if litigation_raw:
+                found_count += len(litigation_raw)
+                relevant_count += len(litigation_raw)
+                articles.extend(await asyncio.gather(*[_attach_body(client, a) for a in litigation_raw]))
+                on_raw_ready(articles)
 
         for window_start, window_end in _search_rounds(date.today()):
             round_new: list[dict] = await _search_window(client, search_query, window_start, window_end, seen_urls)

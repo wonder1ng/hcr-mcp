@@ -485,45 +485,62 @@ def _split_by_coherence(embeddings: list[list[float]]) -> list[list[int]]:
     return clusters
 
 
-def _pick_representatives(subgroup: list[dict], embeddings: list[list[float]]) -> list[dict]:
-    """subgroup 안에서 대표 기사(최대 _ARTICLES_PER_ISSUE건) 선정.
+async def _pick_representatives(articles: list[dict]) -> list[dict]:
+    """articles(전부 같은 순간을 다루는 기사들) 안에서 대표 기사(최대 _ARTICLES_PER_ISSUE건) 선정.
+    임베딩은 호출부에서 받지 않고 여기서 직접 계산한다 — 호출되는 그룹이 항상 작아서(한 자릿수)
+    호출부마다 임베딩을 다시 계산해도 비용이 무시할 만하고, 그래야 호출부가 인덱스 매핑을 신경
+    쓸 필요 없이 dict 리스트만 넘기면 된다(간단함 우선, 상위 호출부의 인덱스 부기 제거).
 
     대표 기사는 언론사 등장 순서가 아니라 본문 임베딩 기준 medoid(그룹 내 다른 기사들과 평균
     유사도가 가장 높은 기사)로 뽑는다 — 예전엔 그룹 순서상 먼저 나온 기사를 그냥 썼는데, 그
     순서가 실제로 "이 이슈를 가장 잘 대표하는 기사"를 보장하지 않아서 무관한 기사가 대표로
     뽑히는 문제가 있었다. medoid는 통계학에서 이상치에 강건한 대표값 선정 기법으로 널리 쓰인다.
     2번째 기사는 medoid와 언론사가 다르면서 medoid와 가장 유사한 기사(언론사 다양성은 2순위로
-    유지)."""
-    if len(subgroup) == 1:
-        return subgroup
+    유지) — 같은 사실을 서로 다른 취재원이 확인해준다는 최소한의 교차검증 의도."""
+    if len(articles) == 1:
+        return articles
+
+    texts = [f"{a['title']} {a.get('body') or a.get('snippet') or ''}".strip() for a in articles]
+    embeddings = await llm_client.embed_batch(texts)
 
     avg_similarity = [
-        sum(_cosine_similarity(embeddings[i], embeddings[j]) for j in range(len(subgroup)) if j != i) / (len(subgroup) - 1)
-        for i in range(len(subgroup))
+        sum(_cosine_similarity(embeddings[i], embeddings[j]) for j in range(len(articles)) if j != i) / (len(articles) - 1)
+        for i in range(len(articles))
     ]
-    medoid_idx = max(range(len(subgroup)), key=lambda i: avg_similarity[i])
+    medoid_idx = max(range(len(articles)), key=lambda i: avg_similarity[i])
 
-    picked = [subgroup[medoid_idx]]
-    seen_press = {subgroup[medoid_idx]["press"]}
+    picked = [articles[medoid_idx]]
+    seen_press = {articles[medoid_idx]["press"]}
     others = sorted(
-        (i for i in range(len(subgroup)) if i != medoid_idx),
+        (i for i in range(len(articles)) if i != medoid_idx),
         key=lambda i: _cosine_similarity(embeddings[i], embeddings[medoid_idx]),
         reverse=True,
     )
     for i in others:  # 1순위: medoid와 언론사 다르면서 가장 유사한 기사
-        if subgroup[i]["press"] not in seen_press:
-            picked.append(subgroup[i])
+        if articles[i]["press"] not in seen_press:
+            picked.append(articles[i])
             break
     if len(picked) < _ARTICLES_PER_ISSUE and others:  # 다른 언론사가 없으면 차순위 유사 기사로
-        picked.append(subgroup[others[0]])
+        picked.append(articles[others[0]])
 
     return picked[:_ARTICLES_PER_ISSUE]
 
 
+_MAX_ARTICLES_PER_ISSUE = 5  # 같은 사건이 여러 날짜(1심/2심/파기환송처럼 절차 단계가 여러 번)에
+                             # 걸쳐 있어도 각 단계를 보존하기 위해 _select_top_issues는 단계별로
+                             # 따로 대표를 뽑는다 — 이 상한은 그 합계에 대한 안전판(장기 소송처럼
+                             # 절차 단계가 극단적으로 많은 사례에서 요약 LLM 토큰 예산이 무한정
+                             # 커지는 걸 막는다). 실측 없이 잡은 추정치라 이후 조정이 필요할 수 있다.
+
+
 async def _select_top_issues(issue_groups: list[list[dict]]) -> list[list[dict]]:
-    """이슈 그룹마다 먼저 _split_by_coherence로 진짜 같은 사건끼리만 남게 쪼갠 뒤(체이닝 방지),
-    각 조각(subgroup)에서 _pick_representatives로 대표 기사를 뽑는다. 결과는 기사 수(관심도
-    proxy) 많은 순으로 랭킹한다(개수 상한 없음)."""
+    """이슈 그룹마다 먼저 _split_by_coherence로 진짜 같은 사건끼리만 남게 쪼갠다(체이닝 방지,
+    내용 기준·날짜 무관 — 소송 제기~몇 달 뒤 판결처럼 시점이 먼 같은 사건도 하나로 유지).
+
+    그 다음 같은 사건 안에서도 날짜가 다른 여러 단계(1심/2심/파기환송 등)가 있으면 전부
+    보존해야 하므로, _dedup_cluster_by_embedding(유사도+1일 날짜창)을 재사용해 "같은 날짜에
+    여러 언론사가 보도한 같은 순간"끼리만 한 번 더 나누고, 그 순간별로 _pick_representatives를
+    적용한다. 결과는 기사 수(관심도 proxy) 많은 순으로 랭킹한다."""
     selected: list[list[dict]] = []
     for group in issue_groups:
         if len(group) == 1:
@@ -535,8 +552,15 @@ async def _select_top_issues(issue_groups: list[list[dict]]) -> list[list[dict]]
 
         for member_idx in _split_by_coherence(embeddings):
             subgroup = [group[i] for i in member_idx]
-            sub_embeddings = [embeddings[i] for i in member_idx]
-            selected.append(_pick_representatives(subgroup, sub_embeddings))
+            if len(subgroup) == 1:
+                selected.append(subgroup)
+                continue
+
+            moment_clusters = await _dedup_cluster_by_embedding(subgroup)
+            picked: list[dict] = []
+            for moment in moment_clusters:
+                picked.extend(await _pick_representatives(moment))
+            selected.append(picked[:_MAX_ARTICLES_PER_ISSUE])
 
     selected.sort(key=len, reverse=True)
     return selected

@@ -39,7 +39,7 @@ import random
 import re
 from calendar import monthrange
 from datetime import date, timedelta
-from typing import Callable
+from typing import Awaitable, Callable
 
 import httpx
 from bs4 import BeautifulSoup
@@ -778,50 +778,57 @@ async def _finalize_issues(issues: list[dict]) -> tuple[list[dict], list[dict]]:
     return topics, raw_issues
 
 
-async def _candidate_articles(candidate: str) -> list[dict]:
-    """후보(경쟁사명/트렌드 키워드) 하나에 대해 네이버 뉴스검색(최근 1페이지, 가벼운 단발 조회
-    — competitor_finder.py의 기존 _naver_page1과 동일한 성격) + LLM web_search를 병렬로 실행해
-    기사 형태로 합친다. 둘 중 하나가 실패해도 다른 하나로 계속 진행 — 후보 하나의 검색 실패가
-    전체 수집을 막지 않는다(보조 정보 성격). candidate는 검색 쿼리 구성 전 법인 표기를
-    제거한다(strip_entity_prefix — 모든 검색 쿼리 구성 지점에서 공통 적용)."""
-    candidate = strip_entity_prefix(candidate)
-
-    async def _naver() -> list[dict]:
-        async with httpx.AsyncClient(follow_redirects=True) as client:
-            try:
-                resp = await client.get(
-                    _SEARCH_URL,
-                    params={"query": candidate, "ssc": "tab.news.all", "sm": "tab_opt", "start": "1"},
-                    headers=_HEADERS, timeout=_REQUEST_TIMEOUT,
-                )
-                resp.raise_for_status()
-            except httpx.HTTPError as e:
-                net.raise_if_ssl_trust_error(e)
-                return []
+async def _naver_search_page1(client: httpx.AsyncClient, query: str) -> list[dict]:
+    """네이버 뉴스검색 1페이지(페이지네이션·기간 필터 없음, 가벼운 단발 조회)만.
+    _fetch_search_page와 동일하게 전송 실패는 랜덤 대기 후 무한 재시도한다 — 실측 확인
+    (2026-07-22): 후보 여러 개를 동시에 검색하면(예: 경쟁사 후보 46개 asyncio.gather) 네이버가
+    봇으로 감지해 요청의 절반 이상을 403으로 차단한다(무작위로 걸려서 정상 후보 데이터가
+    조용히 빈 값이 됨 — 경쟁사 검증 단계가 이 빈 값을 "근거 부족"으로 오판해 실제 경쟁사를
+    걸러내는 사고로 이어짐). 그래서 호출자가 반드시 후보를 순차로(직렬) 호출해야 하고, 이
+    함수 자체도 그 전제 위에서 실패를 조용히 삼키지 않고 재시도한다."""
+    params = {"query": query, "ssc": "tab.news.all", "sm": "tab_opt", "start": "1"}
+    while True:
+        try:
+            resp = await client.get(_SEARCH_URL, params=params, headers=_HEADERS, timeout=_REQUEST_TIMEOUT)
+            resp.raise_for_status()
+        except httpx.HTTPError as e:
+            net.raise_if_ssl_trust_error(e)
+            await asyncio.sleep(random.uniform(*_TRANSPORT_RETRY_DELAY_RANGE))
+            continue
         return _parse_search_page(resp.text)
-
-    naver_result, web_result = await asyncio.gather(_naver(), llm_client.web_search(candidate), return_exceptions=True)
-    naver_articles = naver_result if isinstance(naver_result, list) else []
-    web_text = web_result if isinstance(web_result, str) else ""
-
-    articles = [{**a, "body": a.get("snippet") or ""} for a in naver_articles]
-    if web_text:
-        articles.append(
-            {
-                "title": f"{candidate} 웹검색 요약", "url": None, "naver_url": None, "press": "web_search",
-                "date": date.today().isoformat(), "snippet": web_text[:500], "body": web_text,
-            }
-        )
-    return articles
 
 
 async def _candidate_issues(candidates: list[str]) -> list[dict]:
-    """후보 목록(경쟁사명, 트렌드 키워드 등) 각각에 대해 병렬로 자료를 모아 (finalize 전) raw
-    이슈 목록으로 만든다. 후보는 이미 서로 다른 개별 주제로 확정된 상태라(예: 경쟁사 A/B/C)
-    _group_and_dedup의 근접중복 병합·LLM 그룹핑 단계는 필요 없다 — 후보 하나 = 이슈 하나."""
+    """후보 목록(경쟁사명, 트렌드 키워드 등) 각각에 대해 자료를 모아 (finalize 전) raw 이슈
+    목록으로 만든다. 후보는 이미 서로 다른 개별 주제로 확정된 상태라(예: 경쟁사 A/B/C)
+    _group_and_dedup의 근접중복 병합·LLM 그룹핑 단계는 필요 없다 — 후보 하나 = 이슈 하나.
+
+    네이버 뉴스검색은 후보별로 순차(직렬)로만 호출한다(_naver_search_page1 참고, 동시 호출 시
+    봇 차단 실측 확인) — 반면 LLM web_search는 이 문제가 없어 그대로 병렬 실행."""
     if not candidates:
         return []
-    per_candidate = await asyncio.gather(*[_candidate_articles(c) for c in candidates])
+    queries = [strip_entity_prefix(c) for c in candidates]
+
+    naver_results: list[list[dict]] = []
+    async with httpx.AsyncClient(follow_redirects=True) as client:
+        for query in queries:
+            naver_results.append(await _naver_search_page1(client, query))
+
+    web_results = await asyncio.gather(*[llm_client.web_search(q) for q in queries], return_exceptions=True)
+
+    per_candidate: list[list[dict]] = []
+    for query, naver_articles, web_result in zip(queries, naver_results, web_results):
+        articles = [{**a, "body": a.get("snippet") or ""} for a in naver_articles]
+        web_text = web_result if isinstance(web_result, str) else ""
+        if web_text:
+            articles.append(
+                {
+                    "title": f"{query} 웹검색 요약", "url": None, "naver_url": None, "press": "web_search",
+                    "date": date.today().isoformat(), "snippet": web_text[:500], "body": web_text,
+                }
+            )
+        per_candidate.append(articles)
+
     return [
         {"issue_title": candidate, "occurred_month": date.today().strftime("%Y-%m"), "articles": arts}
         for candidate, arts in zip(candidates, per_candidate) if arts
@@ -829,15 +836,35 @@ async def _candidate_issues(candidates: list[str]) -> list[dict]:
 
 
 async def collect_candidate_topics(
-    candidates: list[str], on_raw_ready: Callable[[list[dict]], None]
+    candidates: list[str],
+    on_raw_ready: Callable[[list[dict]], None],
+    classify: Callable[[str, list[dict]], Awaitable[str]] | None = None,
 ) -> tuple[list[dict], list[dict]]:
     """_candidate_issues를 기업 뉴스와 같은 형태(gist+event_id+중요도)로 토픽 정리해 반환하는
     독립 호출용 진입점(competitor_finder.py가 사용). on_raw_ready: 후보별 자료 수집 직후 즉시
-    호출(의무 저장 — 다른 collect_* 함수와 동일 패턴)."""
+    호출(의무 저장 — 다른 collect_* 함수와 동일 패턴, 분류 결과와 무관하게 수집된 원문은 전부
+    저장). classify: 주어지면 (issue_title, articles)로 호출해 "competitor"/"related_institution"/
+    "unrelated" 중 하나를 받는다 — competitor_finder.py가 "이름만 같고 실제로는 무관한 회사"
+    (동명이인 등, unrelated)를 걸러내고, 경쟁 관계는 아니지만 산업 생태계 관련 대상
+    (related_institution — 공공기관·데이터 제공처 등)은 버리지 않고 별도로 돌려받는 데 사용한다.
+    classify가 없으면 전부 competitor로 취급(기존 동작과 동일).
+    반환: (competitor 토픽, related_institution 토픽) — 둘 다 gist 요약·분류 등 각자 별도로
+    _finalize_issues를 거친다."""
     issues = await _candidate_issues(candidates)
     if issues:
         on_raw_ready([a for i in issues for a in i["articles"]])
-    return await _finalize_issues(issues)
+
+    if classify:
+        categories = await asyncio.gather(*[classify(i["issue_title"], i["articles"]) for i in issues])
+    else:
+        categories = ["competitor"] * len(issues)
+
+    competitor_issues = [i for i, cat in zip(issues, categories) if cat == "competitor"]
+    related_issues = [i for i, cat in zip(issues, categories) if cat == "related_institution"]
+
+    competitor_topics, _ = await _finalize_issues(competitor_issues)
+    related_topics, _ = await _finalize_issues(related_issues)
+    return competitor_topics, related_topics
 
 
 def _months_ago(d: date, months: int) -> date:

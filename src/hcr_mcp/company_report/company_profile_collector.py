@@ -104,12 +104,25 @@ def _find_link_by_keywords(soup: BeautifulSoup, base_url: str, keywords: list[st
     return None
 
 
-async def crawl_page(client: httpx.AsyncClient, url: str) -> tuple[str, str, str]:
-    """(본문 텍스트, 최종 URL, 실패사유) 반환. 성공 시 실패사유는 빈 문자열."""
+_BIZ_NO_RE = re.compile(r"사업자\s*등록\s*번호\s*[:：]?\s*(\d{3}[-\s]?\d{2}[-\s]?\d{5})")
+
+
+def _extract_biz_reg_no(full_page_text: str) -> str | None:
+    """사업자등록번호(하이픈 유무 무관, 숫자 10자리로 정규화)를 페이지 전체 텍스트에서 찾는다."""
+    m = _BIZ_NO_RE.search(full_page_text)
+    return re.sub(r"[-\s]", "", m.group(1)) if m else None
+
+
+async def crawl_page(client: httpx.AsyncClient, url: str) -> tuple[str, str, str, str | None]:
+    """(본문 텍스트, 최종 URL, 실패사유, 사업자등록번호) 반환. 성공 시 실패사유는 빈 문자열."""
     try:
         resp = await client.get(url, headers=_HEADERS, timeout=_REQUEST_TIMEOUT)
         resp.raise_for_status()
         soup = BeautifulSoup(resp.content, "html.parser")
+
+        # _extract_text(soup)는 footer 등을 soup에서 통째로 지워버리므로(decompose), 그 전에
+        # 사업자등록번호 탐색용 원문 전체를 먼저 떠 둔다.
+        biz_reg_no = _extract_biz_reg_no(soup.get_text(" ", strip=True))
 
         sub_url = _find_link_by_keywords(soup, url, ["about", "회사소개", "company", "채용", "인재", "culture"])
         ceo_url = _find_link_by_keywords(soup, url, ["ceo", "message", "대표이사", "인삿말"])
@@ -123,10 +136,10 @@ async def crawl_page(client: httpx.AsyncClient, url: str) -> tuple[str, str, str
         text = " ".join(p for p in parts if p).strip()
         final_text = text[:_MAX_TEXT_LENGTH]
         reason = "" if final_text else "빈 페이지(본문 텍스트 없음, JS 렌더링 가능성)"
-        return final_text, url, reason
+        return final_text, url, reason, biz_reg_no
     except httpx.HTTPError as e:
         net.raise_if_ssl_trust_error(e)
-        return "", url, f"접속 실패({type(e).__name__})"
+        return "", url, f"접속 실패({type(e).__name__})", None
 
 
 _SYSTEM_PROMPT = """당신은 기업 정보를 분석하는 전문가입니다.
@@ -151,6 +164,7 @@ _USER_PROMPT_TEMPLATE = """회사명: {company_name}
   "main_products_services": ["주요 제품/서비스 1", "주요 서비스 2"],
   "talent_values": "인재상 (없으면 null)",
   "ceo_message": "CEO 인삿말 요약 (없으면 null)",
+  "ceo_name": "대표자 이름만 (직함 제외, 없으면 null)",
   "is_company_match": true,
   "crawl_success": true
 }}"""
@@ -220,6 +234,8 @@ def _failure(company_name: str, website_url: str | None, error: str) -> dict:
         "main_products_services": [],
         "talent_values": None,
         "ceo_message": None,
+        "ceo_name": None,
+        "biz_reg_no": None,
         "crawl_success": False,
         "error": error,
     }
@@ -241,7 +257,7 @@ async def collect_company_profile(company_name: str) -> dict:
         if not url:
             return _failure(company_name, None, "URL 탐색 실패: 검색 결과에서 공식 사이트를 찾지 못함")
 
-        text, final_url, fail_reason = await crawl_page(client, url)
+        text, final_url, fail_reason, biz_reg_no = await crawl_page(client, url)
         if not text:
             return _failure(company_name, final_url, fail_reason or "페이지 크롤링 실패")
 
@@ -261,5 +277,6 @@ async def collect_company_profile(company_name: str) -> dict:
         return _failure(company_name, final_url, "내용 없음: 사이트는 맞으나 사업 정보를 추출하지 못함(빈/JS 페이지 가능성)")
 
     result.pop("is_company_match", None)
+    result["biz_reg_no"] = biz_reg_no
     result["crawl_success"] = True
     return result

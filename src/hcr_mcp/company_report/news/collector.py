@@ -93,16 +93,33 @@ _RELEVANCE_LINE = {
 
 _SUBJECT_LABEL = {"company": "기업명", "industry": "산업/업종 키워드", "job": "직무명"}
 
+_GROUP_CRITERION_LINE = {
+    "company": (
+        "2. 남은 기사 중 실질적으로 같은 사건(같은 당사자·같은 시점에 벌어진 하나의 일)을\n"
+        "   다루는 기사끼리만 그룹으로 묶으세요. 언론사마다 제목 표현이 달라도 같은 사건이면\n"
+        "   같은 그룹입니다. 반대로 주제(예: 소송, 특허 분쟁)만 같을 뿐 당사자나 시점이 다른\n"
+        "   별개 사건은 절대 같은 그룹으로 묶지 마세요(예: 서로 다른 상대와 벌인 소송 두 건은\n"
+        "   둘 다 '소송'이어도 별개 그룹). 다른 기사와 묶이지 않는 관련 기사는 그룹 크기 1로\n"
+        "   두세요.\n"
+    ),
+    "industry": (
+        "2. 남은 기사 중 실질적으로 같은 사건이나 같은 트렌드/이슈를 다루는 기사끼리 그룹으로\n"
+        "   묶으세요. 언론사마다 제목 표현이 달라도 같은 사건·트렌드면 같은 그룹입니다. 다른\n"
+        "   기사와 묶이지 않는 관련 기사는 그룹 크기 1로 두세요.\n"
+    ),
+}
+_GROUP_CRITERION_LINE["job"] = _GROUP_CRITERION_LINE["industry"]
+
+
 def _group_system_prompt(keyword: str, subject_kind: str) -> str:
     relevance_line = _RELEVANCE_LINE[subject_kind].format(keyword=keyword)
+    group_criterion_line = _GROUP_CRITERION_LINE[subject_kind]
     return (
         f'"{keyword}"는 {_SUBJECT_LABEL[subject_kind]}입니다(일반 명사와 우연히 같은 표기여도 이 의미로 판단하세요).\n'
         f'당신은 "{keyword}" 관련 뉴스를 수집하는 스크래퍼입니다.\n'
         "번호가 매겨진 기사 제목·날짜 목록이 주어지면 두 가지를 하세요:\n"
         f"{relevance_line}"
-        "2. 남은 기사 중 실질적으로 같은 사건이나 같은 트렌드/이슈를 다루는 기사끼리 그룹으로\n"
-        "   묶으세요. 언론사마다 제목 표현이 달라도 같은 사건·트렌드면 같은 그룹입니다. 다른\n"
-        "   기사와 묶이지 않는 관련 기사는 그룹 크기 1로 두세요.\n"
+        f"{group_criterion_line}"
         '다른 설명 없이 순수 JSON으로만 응답하세요: {"groups": [[0,2,5], [1], [3,4]]}\n'
         "groups는 인덱스 배열의 배열입니다. 제외한 기사의 인덱스는 어떤 그룹에도 넣지 마세요."
     )
@@ -425,18 +442,107 @@ async def _group_into_issues_batched(keyword: str, subject_kind: str, articles: 
     return batch_groups
 
 
-async def _select_top_issues(issue_groups: list[list[dict]]) -> list[list[dict]]:
-    """기사 수(관심도 proxy) 많은 순으로 랭킹(개수 상한 없음), 이슈당 대표 기사(최대 2건) 선정.
+_ISSUE_COHERENCE_THRESHOLD = 0.65  # 그룹 안의 기사들이 "정말 같은 사건/사안"인지 검증하는
+                                   # 임계값(_split_by_coherence 전용). _DEDUP_SIMILARITY_THRESHOLD
+                                   # (0.86)는 "같은 날 다른 언론사가 쓴 사실상 동일 기사"용으로
+                                   # 튜닝된 값이라 여기엔 너무 빡빡하다 — 소송 제기~몇 달 뒤 판결
+                                   # 처럼 시점이 멀리 떨어진 같은 사건은 문구가 겹치지 않아 유사도가
+                                   # 훨씬 낮게 나온다. 실측 없이 잡은 추정치라 이후 조정이 필요할 수
+                                   # 있다.
+
+
+def _split_by_coherence(embeddings: list[list[float]]) -> list[list[int]]:
+    """LLM 그룹핑(_group_into_issues)이 서로 다른 사건을 하나의 이슈로 잘못 묶는 체이닝 문제를
+    막는 결정론적 안전망(실측으로 발견: "여러 소송을 한 번에 다루는 총평 기사"가 실제로는 무관한
+    사건 A·C 둘 다와 어느 정도 유사해서, LLM이 A·총평·C를 전부 한 그룹으로 묶어버림).
+
+    표준 complete-link(최장연결) 계층적 응집 클러스터링: 두 클러스터를 합칠 때 그 안의 "가장 먼
+    (최소 유사도) 쌍"까지 임계값을 넘어야만 합친다. average-link(_dedup_cluster_by_embedding이
+    쓰는, 클러스터 평균과만 비교하는 방식)는 다리 역할을 하는 기사 하나 때문에 무관한 두 사건이
+    사슬처럼 엮이는 체이닝에 취약하지만, complete-link은 구조적으로 이를 막는다(A-C가 서로
+    무관하면 총평 기사를 매개로도 둘이 한 클러스터로 합쳐지지 않는다).
+
+    _dedup_cluster_by_embedding의 1일 날짜창은 여기선 안 쓴다 — 소송 제기와 몇 달 뒤 판결처럼
+    시점이 먼 같은 사건을 하나로 묶는 게 목적이라 날짜창을 걸면 그 목적과 충돌한다.
+
+    입력 임베딩 개수(n)는 LLM이 한 번에 묶은 이슈 그룹 크기라 항상 작다(한 자릿수~수십 건
+    수준) — O(n^2)~O(n^3) 탐색이어도 실행 시간은 무시할 만하다."""
+    clusters: list[list[int]] = [[i] for i in range(len(embeddings))]
+
+    while len(clusters) > 1:
+        best_sim, best_pair = -1.0, None
+        for a in range(len(clusters)):
+            for b in range(a + 1, len(clusters)):
+                min_sim = min(_cosine_similarity(embeddings[i], embeddings[j]) for i in clusters[a] for j in clusters[b])
+                if min_sim > best_sim:
+                    best_sim, best_pair = min_sim, (a, b)
+        if best_sim < _ISSUE_COHERENCE_THRESHOLD:
+            break
+        a, b = best_pair
+        clusters[a].extend(clusters[b])
+        del clusters[b]
+
+    return clusters
+
+
+async def _pick_representatives(articles: list[dict]) -> list[dict]:
+    """articles(전부 같은 순간을 다루는 기사들) 안에서 대표 기사(최대 _ARTICLES_PER_ISSUE건) 선정.
+    임베딩은 호출부에서 받지 않고 여기서 직접 계산한다 — 호출되는 그룹이 항상 작아서(한 자릿수)
+    호출부마다 임베딩을 다시 계산해도 비용이 무시할 만하고, 그래야 호출부가 인덱스 매핑을 신경
+    쓸 필요 없이 dict 리스트만 넘기면 된다(간단함 우선, 상위 호출부의 인덱스 부기 제거).
 
     대표 기사는 언론사 등장 순서가 아니라 본문 임베딩 기준 medoid(그룹 내 다른 기사들과 평균
     유사도가 가장 높은 기사)로 뽑는다 — 예전엔 그룹 순서상 먼저 나온 기사를 그냥 썼는데, 그
-    순서가 실제로 "이 이슈를 가장 잘 대표하는 기사"를 보장하지 않아서 무관한 기사가 대표로 뽑히는 문제가 있었다. medoid는 통계학에서 이상치에
-    강건한 대표값 선정 기법으로 널리 쓰인다. 2번째 기사는 medoid와 언론사가 다르면서 medoid와
-    가장 유사한 기사(언론사 다양성은 2순위로 유지)."""
-    ranked = sorted(issue_groups, key=len, reverse=True)
+    순서가 실제로 "이 이슈를 가장 잘 대표하는 기사"를 보장하지 않아서 무관한 기사가 대표로
+    뽑히는 문제가 있었다. medoid는 통계학에서 이상치에 강건한 대표값 선정 기법으로 널리 쓰인다.
+    2번째 기사는 medoid와 언론사가 다르면서 medoid와 가장 유사한 기사(언론사 다양성은 2순위로
+    유지) — 같은 사실을 서로 다른 취재원이 확인해준다는 최소한의 교차검증 의도."""
+    if len(articles) == 1:
+        return articles
 
+    texts = [f"{a['title']} {a.get('body') or a.get('snippet') or ''}".strip() for a in articles]
+    embeddings = await llm_client.embed_batch(texts)
+
+    avg_similarity = [
+        sum(_cosine_similarity(embeddings[i], embeddings[j]) for j in range(len(articles)) if j != i) / (len(articles) - 1)
+        for i in range(len(articles))
+    ]
+    medoid_idx = max(range(len(articles)), key=lambda i: avg_similarity[i])
+
+    picked = [articles[medoid_idx]]
+    seen_press = {articles[medoid_idx]["press"]}
+    others = sorted(
+        (i for i in range(len(articles)) if i != medoid_idx),
+        key=lambda i: _cosine_similarity(embeddings[i], embeddings[medoid_idx]),
+        reverse=True,
+    )
+    for i in others:  # 1순위: medoid와 언론사 다르면서 가장 유사한 기사
+        if articles[i]["press"] not in seen_press:
+            picked.append(articles[i])
+            break
+    if len(picked) < _ARTICLES_PER_ISSUE and others:  # 다른 언론사가 없으면 차순위 유사 기사로
+        picked.append(articles[others[0]])
+
+    return picked[:_ARTICLES_PER_ISSUE]
+
+
+_MAX_ARTICLES_PER_ISSUE = 5  # 같은 사건이 여러 날짜(1심/2심/파기환송처럼 절차 단계가 여러 번)에
+                             # 걸쳐 있어도 각 단계를 보존하기 위해 _select_top_issues는 단계별로
+                             # 따로 대표를 뽑는다 — 이 상한은 그 합계에 대한 안전판(장기 소송처럼
+                             # 절차 단계가 극단적으로 많은 사례에서 요약 LLM 토큰 예산이 무한정
+                             # 커지는 걸 막는다). 실측 없이 잡은 추정치라 이후 조정이 필요할 수 있다.
+
+
+async def _select_top_issues(issue_groups: list[list[dict]]) -> list[list[dict]]:
+    """이슈 그룹마다 먼저 _split_by_coherence로 진짜 같은 사건끼리만 남게 쪼갠다(체이닝 방지,
+    내용 기준·날짜 무관 — 소송 제기~몇 달 뒤 판결처럼 시점이 먼 같은 사건도 하나로 유지).
+
+    그 다음 같은 사건 안에서도 날짜가 다른 여러 단계(1심/2심/파기환송 등)가 있으면 전부
+    보존해야 하므로, _dedup_cluster_by_embedding(유사도+1일 날짜창)을 재사용해 "같은 날짜에
+    여러 언론사가 보도한 같은 순간"끼리만 한 번 더 나누고, 그 순간별로 _pick_representatives를
+    적용한다. 결과는 기사 수(관심도 proxy) 많은 순으로 랭킹한다."""
     selected: list[list[dict]] = []
-    for group in ranked:
+    for group in issue_groups:
         if len(group) == 1:
             selected.append(group)
             continue
@@ -444,27 +550,19 @@ async def _select_top_issues(issue_groups: list[list[dict]]) -> list[list[dict]]
         texts = [f"{a['title']} {a.get('body') or a.get('snippet') or ''}".strip() for a in group]
         embeddings = await llm_client.embed_batch(texts)
 
-        avg_similarity = [
-            sum(_cosine_similarity(embeddings[i], embeddings[j]) for j in range(len(group)) if j != i) / (len(group) - 1)
-            for i in range(len(group))
-        ]
-        medoid_idx = max(range(len(group)), key=lambda i: avg_similarity[i])
+        for member_idx in _split_by_coherence(embeddings):
+            subgroup = [group[i] for i in member_idx]
+            if len(subgroup) == 1:
+                selected.append(subgroup)
+                continue
 
-        picked = [group[medoid_idx]]
-        seen_press = {group[medoid_idx]["press"]}
-        others = sorted(
-            (i for i in range(len(group)) if i != medoid_idx),
-            key=lambda i: _cosine_similarity(embeddings[i], embeddings[medoid_idx]),
-            reverse=True,
-        )
-        for i in others:  # 1순위: medoid와 언론사 다르면서 가장 유사한 기사
-            if group[i]["press"] not in seen_press:
-                picked.append(group[i])
-                break
-        if len(picked) < _ARTICLES_PER_ISSUE and others:  # 다른 언론사가 없으면 차순위 유사 기사로
-            picked.append(group[others[0]])
+            moment_clusters = await _dedup_cluster_by_embedding(subgroup)
+            picked: list[dict] = []
+            for moment in moment_clusters:
+                picked.extend(await _pick_representatives(moment))
+            selected.append(picked[:_MAX_ARTICLES_PER_ISSUE])
 
-        selected.append(picked[:_ARTICLES_PER_ISSUE])
+    selected.sort(key=len, reverse=True)
     return selected
 
 
@@ -794,15 +892,21 @@ async def _finalize_issues(issues: list[dict]) -> tuple[list[dict], list[dict]]:
     return topics, raw_issues
 
 
-async def _naver_search_page1(client: httpx.AsyncClient, query: str) -> list[dict]:
+async def _naver_search_page1(client: httpx.AsyncClient, query: str, sort: str | None = None) -> list[dict]:
     """네이버 뉴스검색 1페이지(페이지네이션·기간 필터 없음, 가벼운 단발 조회)만.
     _fetch_search_page와 동일하게 전송 실패는 랜덤 대기 후 무한 재시도한다 — 실측 확인
     (2026-07-22): 후보 여러 개를 동시에 검색하면(예: 경쟁사 후보 46개 asyncio.gather) 네이버가
     봇으로 감지해 요청의 절반 이상을 403으로 차단한다(무작위로 걸려서 정상 후보 데이터가
     조용히 빈 값이 됨 — 경쟁사 검증 단계가 이 빈 값을 "근거 부족"으로 오판해 실제 경쟁사를
     걸러내는 사고로 이어짐). 그래서 호출자가 반드시 후보를 순차로(직렬) 호출해야 하고, 이
-    함수 자체도 그 전제 위에서 실패를 조용히 삼키지 않고 재시도한다."""
+    함수 자체도 그 전제 위에서 실패를 조용히 삼키지 않고 재시도한다.
+
+    sort: 생략하면 기존 호출부와 동일한 네이버 기본 정렬. 소송/판결 등 관련도가 중요한 보조
+    검색은 "0"(관련도순)을 명시적으로 넘긴다(사용자 제공 레퍼런스 URL로 확인) — "1"(최신순)은
+    날짜 구간 검색(_date_range_params) 전용이라 여기선 안 씀."""
     params = {"query": query, "ssc": "tab.news.all", "sm": "tab_opt", "start": "1"}
+    if sort is not None:
+        params["sort"] = sort
     while True:
         try:
             resp = await client.get(_SEARCH_URL, params=params, headers=_HEADERS, timeout=_REQUEST_TIMEOUT)
@@ -939,6 +1043,26 @@ def _filter_unrelated_issues(keyword: str, subject_kind: str, issue_groups: list
     ]
 
 
+_LITIGATION_QUERY_TEMPLATES = ['{name} 소송', '{name} 판결', '기업 "{name}" 소송', '기업 "{name}" 판결']
+
+
+async def _collect_litigation_articles(client: httpx.AsyncClient, company_name: str, seen_urls: set[str]) -> list[dict]:
+    """소송/판결 관련 기사를 관련도순(sort="0")으로 보조 수집한다(사용자 제안, 2026-07-23) —
+    일반 회사명 검색(날짜 구간+최신순)은 소송·판결처럼 화제성이 약한 기사가 순위 밖으로 밀려
+    누락될 수 있음(실측 확인: ㈜윕스↔워트인텔리전스 간 "명예훼손" 소송 기사가 일반 검색에서
+    안 잡힘). 네이버 동시 요청 차단을 피하려 쿼리 4개를 순차로 조회한다(_naver_search_page1
+    참고). 반환은 title/url/snippet/press/date만 있는 검색 결과(본문 미포함) — 호출자가 기존
+    파이프라인과 동일하게 관련성 필터 후 본문을 붙인다."""
+    articles: list[dict] = []
+    for template in _LITIGATION_QUERY_TEMPLATES:
+        for a in await _naver_search_page1(client, template.format(name=company_name), sort="0"):
+            if a["url"] in seen_urls:
+                continue
+            seen_urls.add(a["url"])
+            articles.append(a)
+    return articles
+
+
 async def _group_and_dedup(keyword: str, subject_kind: str, articles: list[dict]) -> list[list[dict]]:
     """근접 중복 사전 병합(_dedup_cluster_by_embedding) → LLM 그룹핑(대표 기사만 대상) → 원래
     클러스터로 확장 → 회사 이슈는 결정론적 무관 기사 필터까지 적용한 최종 이슈 그룹."""
@@ -986,6 +1110,19 @@ async def _collect_issues(
         selected: list[list[dict]] = []
         found_count = 0     # 관련성 필터 이전, 검색으로 실제 찾은 기사 수(누적) — "검색 결과 자체가 없음" 판단용
         relevant_count = 0  # 관련성 필터 통과 기사 수(누적) — 노이즈 비율 계산용(임베딩/그룹핑 완료를 기다릴 필요 없음)
+
+        if subject_kind == "company":
+            # 날짜 구간 라운드보다 먼저 한 번만 실행 — 이 기사들도 같은 articles 풀에 합류해서
+            # _group_and_dedup의 임베딩 기반 근접중복 병합이 일반 검색과 겹치는 기사를 자동으로
+            # 하나로 합쳐준다(별도 병합 로직 불필요).
+            litigation_raw = await _collect_litigation_articles(client, display_keyword, seen_urls)
+            if litigation_raw:
+                litigation_raw = await _filter_relevant(display_keyword, subject_kind, litigation_raw)
+            if litigation_raw:
+                found_count += len(litigation_raw)
+                relevant_count += len(litigation_raw)
+                articles.extend(await asyncio.gather(*[_attach_body(client, a) for a in litigation_raw]))
+                on_raw_ready(articles)
 
         for window_start, window_end in _search_rounds(date.today()):
             round_new: list[dict] = await _search_window(client, search_query, window_start, window_end, seen_urls)

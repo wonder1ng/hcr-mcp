@@ -10,12 +10,13 @@
 
 import asyncio
 import json
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 
 from hcr_mcp import llm_client
 from hcr_mcp.company_report import competitor_finder, fresh_generator
 from hcr_mcp.company_report.news import collector as news_collector
+from hcr_mcp.company_report.news.collector import _CALENDAR_YEARS_BACK, _EARLY_YEAR_CUTOFF_MONTH
 from hcr_mcp.storage import Storage
 
 _ANALYSIS_VERSION = "v1"
@@ -194,31 +195,27 @@ def _lighten_topics_for_llm(topics: list[dict]) -> list[dict]:
     ]
 
 
-def _fiscal_year_bucket(occurred_month: str) -> str:
-    """"YYYY-MM" -> 한국 회계연도 라벨(4월~다음해 3월을 한 해로 — 사용자 결정, 2026-07-22).
-    1~3월이면 전년도 회계연도에 속한다."""
-    year, month = int(occurred_month[:4]), int(occurred_month[5:7])
-    fiscal_year = year if month >= 4 else year - 1
-    return str(fiscal_year)
-
-
-_YEARLY_ISSUES_MAX_YEARS = 3
-
-
 def _build_yearly_issues(topics_by_category: dict[str, list[dict]]) -> dict[str, list[dict]]:
-    """토픽 카테고리별(company/industry/competitor/job) 이슈들을 한국 회계연도 기준 최근
-    3개년으로 재배열한다(각 이슈에 원래 카테고리를 category로 태그) — hcr-backend 스키마엔
-    없는 신규 필드. 카테고리별로 이미 수집된 이슈를 시점 축으로 다시 묶는 것뿐이라 재수집은
-    없다."""
-    buckets: dict[str, list[dict]] = {}
+    """토픽 카테고리별(company/industry/competitor/job) 이슈들을 캘린더 연도(occurred_month의
+    연도 그대로, 가공 없음) 3개년으로 재배열한다(각 이슈에 원래 카테고리를 category로 태그).
+    목표 3개년은 news/collector._search_rounds와 같은 규칙(_CALENDAR_YEARS_BACK/
+    _EARLY_YEAR_CUTOFF_MONTH)으로 오늘 날짜 기준 정한다 — 수집 자체가 이 규칙으로 캘린더
+    연도를 잡으므로 버킷도 같은 기준이어야 한다(2026-07-23, 사용자 지적으로 수정: 이슈별로
+    4월~3월 스팬을 적용하던 이전 버전은 목적과 안 맞았음)."""
+    today = date.today()
+    start_year = today.year - _CALENDAR_YEARS_BACK - (1 if today.month < _EARLY_YEAR_CUTOFF_MONTH else 0)
+    buckets: dict[str, list[dict]] = {str(start_year + i): [] for i in range(_CALENDAR_YEARS_BACK + 1)}
+
     for category, topics in topics_by_category.items():
         for topic in topics:
             for issue in topic["issues"]:
-                fiscal_year = _fiscal_year_bucket(issue["occurred_month"])
-                buckets.setdefault(fiscal_year, []).append({**issue, "category": category})
+                year = (issue.get("occurred_month") or "")[:4]
+                if year in buckets:
+                    buckets[year].append({**issue, "category": category})
 
-    recent_years = sorted(buckets.keys(), reverse=True)[:_YEARLY_ISSUES_MAX_YEARS]
-    return {year: sorted(buckets[year], key=lambda i: i["importance"], reverse=True) for year in recent_years}
+    for issues in buckets.values():
+        issues.sort(key=lambda i: i["importance"], reverse=True)
+    return buckets
 
 
 async def _empty_topics() -> tuple[list[dict], list[dict]]:

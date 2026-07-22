@@ -56,11 +56,15 @@ async def generate_base_report(
     job_posting_url: str | None = None,
     company_info_url: str | None = None,
     company_info_screenshot_paths: list[str | Path] | None = None,
-) -> CompanyReportBase:
+) -> tuple[CompanyReportBase, dict[str, bool]]:
     """DART(선택)+홈페이지+채용사이트 기업정보(선택)+뉴스 요약(선택)을 모아 LLM으로 base
     리포트를 합성한다. job_posting_url이 없으면 채용사이트 기업정보 수집을 건너뛴다
     (company_info_url/screenshot만으로는 원 공고 링크를 못 찾아 기업정보 페이지 자동 추적이
-    불가능하므로)."""
+    불가능하므로).
+
+    반환: (합성된 리포트, 소스 가용성). 두 번째 값은 report_builder.py가 최종 report.json의
+    source_snapshot(has_dart/has_company_profile/has_recruit_data)을 채우는 데 쓴다 — 이
+    함수가 각 소스의 실제 수집 성공 여부를 이미 알고 있어 호출자가 따로 재확인할 필요가 없다."""
     profile_and_dart = _collect_profile_and_dart(company_name, dart_api_key, cache_dir)
 
     if job_posting_url:
@@ -73,7 +77,7 @@ async def generate_base_report(
         recruit_site = None
 
     chain = llm_client.structured_chain(SYNTHESIS_SYSTEM, SYNTHESIS_HUMAN, CompanyReportBase)
-    return await llm_client.safe_ainvoke(
+    base = await llm_client.safe_ainvoke(
         chain,
         {
             "company_name": company_name,
@@ -83,3 +87,9 @@ async def generate_base_report(
             "recruit_site_json": _fmt(recruit_site),
         },
     )
+    source_flags = {
+        "has_dart": dart_data is not None,
+        "has_company_profile": bool(company_profile.get("crawl_success")),
+        "has_recruit_data": recruit_site is not None,
+    }
+    return base, source_flags

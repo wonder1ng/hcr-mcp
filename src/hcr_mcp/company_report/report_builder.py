@@ -10,11 +10,15 @@
 
 import asyncio
 import json
+from datetime import datetime
+from pathlib import Path
 
 from hcr_mcp import llm_client
-from hcr_mcp.company_report import competitor_finder
+from hcr_mcp.company_report import competitor_finder, fresh_generator
 from hcr_mcp.company_report.news import collector as news_collector
 from hcr_mcp.storage import Storage
+
+_ANALYSIS_VERSION = "v1"
 
 
 async def collect_and_save_news(
@@ -98,6 +102,123 @@ async def collect_and_save_news(
     )
 
     return company_topics, industry_topics, competitor_topics, job_topics
+
+
+async def build_and_save_report(
+    storage: Storage,
+    company_name: str,
+    dart_api_key: str | None,
+    cache_dir: Path,
+    industry_keywords: list[str],
+    job_title: str | None = None,
+    ceo_name: str | None = None,
+    job_posting_url: str | None = None,
+    company_info_url: str | None = None,
+    company_info_screenshot_paths: list[str | Path] | None = None,
+) -> dict:
+    """뉴스 수집(collect_and_save_news) + base 리포트 합성(fresh_generator.generate_base_report)을
+    병합해 최종 report.json을 만들어 저장한다(company_report MCP 툴의 핵심 진입점이 될 함수).
+    뉴스가 base 합성 프롬프트의 입력으로도 쓰이므로 뉴스 수집이 먼저 끝나야 한다 — 병렬화 불가.
+
+    hcr-backend company_analyses 스키마(참고 템플릿, schemas.py 상단 참고)에 있지만
+    CompanyReportBase(LLM 합성 대상)에는 없는 필드를 여기서 채운다: recent_trends(원본에서
+    항상 null), jobplanet_review_summary(v1은 신규 수집기 없이 항상 빈 값), source_snapshot,
+    sources/analysis_version/generated_at/updated_at. yearly_issues는 원본 스키마에 없는
+    신규 필드(3개년 이슈 정리, _build_yearly_issues 참고)."""
+    company_topics, industry_topics, competitor_topics, job_topics = await collect_and_save_news(
+        storage, company_name, industry_keywords, job_title, ceo_name
+    )
+    # LLM 합성 프롬프트엔 issue_title/occurred_month/gist/event_id/importance만 남긴 가벼운
+    # 사본을 넘긴다 — gist가 이미 원문 기사 본문을 읽고 요약한 결과라 원문(articles)을 그대로
+    # 다시 넘기는 건 중복이고, embedding(1536차원)은 텍스트 프롬프트에 넣을 이유가 없으며,
+    # detail_summary(gist보다 긴 상세본, 사용자 열람용)까지 다 넣으면 합성엔 불필요하게 큼 —
+    # 실측 확인: 전체 이슈 그대로 넘겼을 때 요청 토큰이 192만 개(OpenAI rate limit 20만 초과),
+    # embedding만 빼도 154,087 토큰으로 128k 컨텍스트 한도 초과. 원본(company_topics 등, embedding/
+    # detail_summary/articles 전부 포함)은 yearly_issues/저장에는 그대로 쓴다.
+    news_summary = {
+        "company_topics": _lighten_topics_for_llm(company_topics),
+        "industry_topics": _lighten_topics_for_llm(industry_topics),
+        "competitor_topics": _lighten_topics_for_llm(competitor_topics),
+        "job_topics": _lighten_topics_for_llm(job_topics),
+    }
+
+    base, source_flags = await fresh_generator.generate_base_report(
+        company_name, dart_api_key, cache_dir, news_summary=news_summary,
+        job_posting_url=job_posting_url, company_info_url=company_info_url,
+        company_info_screenshot_paths=company_info_screenshot_paths,
+    )
+
+    news_count = sum(
+        len(topic["issues"])
+        for topics in (company_topics, industry_topics, competitor_topics, job_topics)
+        for topic in topics
+    )
+    now = datetime.now().isoformat(timespec="seconds")
+    report = {
+        **base.model_dump(),
+        "recent_trends": None,
+        "jobplanet_review_summary": {"summary": "관련 데이터 없음", "evidence": []},
+        "yearly_issues": _build_yearly_issues(
+            {
+                "company": company_topics,
+                "industry": industry_topics,
+                "competitor": competitor_topics,
+                "job": job_topics,
+            }
+        ),
+        "source_snapshot": {
+            "news_count": news_count,
+            "jobplanet_review_count": 0,
+            **source_flags,
+        },
+        "sources": [],
+        "analysis_version": _ANALYSIS_VERSION,
+        "generated_at": now,
+        "updated_at": now,
+    }
+    storage.save_report("company_report", company_name, report)
+    return report
+
+
+_LLM_SUMMARY_ISSUE_KEYS = {"issue_title", "occurred_month", "gist", "event_id", "importance", "category"}
+
+
+def _lighten_topics_for_llm(topics: list[dict]) -> list[dict]:
+    """LLM 합성 프롬프트에 넘길 토픽 사본에서 issue_title/occurred_month/gist/event_id/importance
+    만 남긴다(원본은 그대로 두고 얕은 사본만 만듦) — embedding(로컬 RAG용, 텍스트 프롬프트에
+    넣을 이유 없음)·articles(gist가 이미 이 본문을 읽고 요약한 결과라 중복)·detail_summary
+    (사용자 열람용 상세본, 합성엔 불필요하게 큼)는 전부 뺀다."""
+    return [
+        {**topic, "issues": [{k: v for k, v in issue.items() if k in _LLM_SUMMARY_ISSUE_KEYS} for issue in topic["issues"]]}
+        for topic in topics
+    ]
+
+
+def _fiscal_year_bucket(occurred_month: str) -> str:
+    """"YYYY-MM" -> 한국 회계연도 라벨(4월~다음해 3월을 한 해로 — 사용자 결정, 2026-07-22).
+    1~3월이면 전년도 회계연도에 속한다."""
+    year, month = int(occurred_month[:4]), int(occurred_month[5:7])
+    fiscal_year = year if month >= 4 else year - 1
+    return str(fiscal_year)
+
+
+_YEARLY_ISSUES_MAX_YEARS = 3
+
+
+def _build_yearly_issues(topics_by_category: dict[str, list[dict]]) -> dict[str, list[dict]]:
+    """토픽 카테고리별(company/industry/competitor/job) 이슈들을 한국 회계연도 기준 최근
+    3개년으로 재배열한다(각 이슈에 원래 카테고리를 category로 태그) — hcr-backend 스키마엔
+    없는 신규 필드. 카테고리별로 이미 수집된 이슈를 시점 축으로 다시 묶는 것뿐이라 재수집은
+    없다."""
+    buckets: dict[str, list[dict]] = {}
+    for category, topics in topics_by_category.items():
+        for topic in topics:
+            for issue in topic["issues"]:
+                fiscal_year = _fiscal_year_bucket(issue["occurred_month"])
+                buckets.setdefault(fiscal_year, []).append({**issue, "category": category})
+
+    recent_years = sorted(buckets.keys(), reverse=True)[:_YEARLY_ISSUES_MAX_YEARS]
+    return {year: sorted(buckets[year], key=lambda i: i["importance"], reverse=True) for year in recent_years}
 
 
 async def _empty_topics() -> tuple[list[dict], list[dict]]:
